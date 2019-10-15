@@ -53,7 +53,7 @@ Both of the following URI's give you the cluster information.
 
 | Properties | Data Type | Description |
 |:---- |:---- |:---- |
-| id | long | The NodeManager id |
+| id | string | The NodeManager id |
 | nodeHostName | string | The host name of the NodeManager |
 | totalPmemAllocatedContainersMB | long | The amount of physical memory allocated for use by containers in MB |
 | totalVmemAllocatedContainersMB | long | The amount of virtual memory allocated for use by containers in MB |
