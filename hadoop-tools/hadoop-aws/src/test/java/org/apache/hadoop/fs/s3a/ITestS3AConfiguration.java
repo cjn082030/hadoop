@@ -159,6 +159,7 @@ public class ITestS3AConfiguration {
     return intercept(clazz,
         () -> {
           fs = S3ATestUtils.createTestFileSystem(conf);
+          fs.listFiles(new Path("/"), false);
           return "expected failure creating FS " + text + " got " + fs;
         });
   }
@@ -388,6 +389,19 @@ public class ITestS3AConfiguration {
         "clientConfiguration");
     assertEquals("MyApp, Hadoop " + VersionInfo.getVersion(),
         awsConf.getUserAgentPrefix());
+  }
+
+  @Test
+  public void testRequestTimeout() throws Exception {
+    conf = new Configuration();
+    conf.set(REQUEST_TIMEOUT, "120");
+    fs = S3ATestUtils.createTestFileSystem(conf);
+    AmazonS3 s3 = fs.getAmazonS3ClientForTesting("Request timeout (ms)");
+    ClientConfiguration awsConf = getField(s3, ClientConfiguration.class,
+        "clientConfiguration");
+    assertEquals("Configured " + REQUEST_TIMEOUT +
+        " is different than what AWS sdk configuration uses internally",
+        120000, awsConf.getRequestTimeout());
   }
 
   @Test

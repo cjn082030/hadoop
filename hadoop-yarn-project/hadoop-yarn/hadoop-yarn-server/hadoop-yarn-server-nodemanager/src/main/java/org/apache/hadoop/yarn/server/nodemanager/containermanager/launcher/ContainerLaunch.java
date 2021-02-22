@@ -96,7 +96,7 @@ import org.apache.hadoop.yarn.server.security.AMSecretKeys;
 import org.apache.hadoop.yarn.util.Apps;
 import org.apache.hadoop.yarn.util.AuxiliaryServiceHelper;
 
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -1620,6 +1620,9 @@ public class ContainerLaunch implements Callable<Integer> {
 
     addToEnvMap(environment, nmVars, Environment.PWD.name(), pwd.toString());
 
+    addToEnvMap(environment, nmVars, Environment.LOCALIZATION_COUNTERS.name(),
+        container.localizationCountersAsString());
+
     if (!Shell.WINDOWS) {
       addToEnvMap(environment, nmVars, "JVM_PID", "$$");
     }
@@ -1632,6 +1635,27 @@ public class ContainerLaunch implements Callable<Integer> {
         File.pathSeparator);
     nmVars.addAll(Apps.getEnvVarsFromInputProperty(
         YarnConfiguration.NM_ADMIN_USER_ENV, defEnvStr, conf));
+
+    if (!Shell.WINDOWS) {
+      // maybe force path components
+      String forcePath = conf.get(YarnConfiguration.NM_ADMIN_FORCE_PATH,
+          YarnConfiguration.DEFAULT_NM_ADMIN_FORCE_PATH);
+      if (!forcePath.isEmpty()) {
+        String userPath = environment.get(Environment.PATH.name());
+        environment.remove(Environment.PATH.name());
+        if (userPath == null || userPath.isEmpty()) {
+          Apps.addToEnvironment(environment, Environment.PATH.name(),
+              forcePath, File.pathSeparator);
+          Apps.addToEnvironment(environment, Environment.PATH.name(),
+              "$PATH", File.pathSeparator);
+        } else {
+          Apps.addToEnvironment(environment, Environment.PATH.name(),
+              forcePath, File.pathSeparator);
+          Apps.addToEnvironment(environment, Environment.PATH.name(),
+              userPath, File.pathSeparator);
+        }
+      }
+    }
 
     // TODO: Remove Windows check and use this approach on all platforms after
     // additional testing.  See YARN-358.

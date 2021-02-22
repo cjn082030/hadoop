@@ -37,7 +37,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 
 @Private
 @VisibleForTesting
@@ -196,7 +196,7 @@ public class WorkflowPriorityMappingsManager {
           Priority mappedPriority = getMappedPriority(workflowID, queue);
           if (mappedPriority != null) {
             LOG.info("Application " + applicationId + " user " + user
-                + " workflow " + workflowID + " queue " + queue.getQueueName()
+                + " workflow " + workflowID + " queue " + queue.getQueuePath()
                 + " mapping [" + priority + "] to [" + mappedPriority
                 + "] override " + overrideWithPriorityMappings);
 
@@ -206,7 +206,7 @@ public class WorkflowPriorityMappingsManager {
             priority = mappedPriority;
             priority = scheduler.checkAndGetApplicationPriority(
                 priority, UserGroupInformation.createRemoteUser(user),
-                queue.getQueueName(), applicationId);
+                queue.getQueuePath(), applicationId);
             rmApp.getApplicationSubmissionContext().setPriority(priority);
             ((RMAppImpl)rmApp).setApplicationPriority(priority);
           }

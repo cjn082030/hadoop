@@ -18,7 +18,9 @@
 
 package org.apache.hadoop.fs.s3a.impl;
 
+import javax.annotation.Nullable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
@@ -30,7 +32,6 @@ import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.hadoop.fs.impl.WrappedIOException;
 import org.apache.hadoop.util.DurationInfo;
 
 import static org.apache.hadoop.fs.impl.FutureIOSupport.raiseInnerCause;
@@ -62,9 +63,9 @@ public final class CallableSupplier<T> implements Supplier {
     } catch (RuntimeException e) {
       throw e;
     } catch (IOException e) {
-      throw new WrappedIOException(e);
+      throw new UncheckedIOException(e);
     } catch (Exception e) {
-      throw new WrappedIOException(new IOException(e));
+      throw new UncheckedIOException(new IOException(e));
     }
   }
 
@@ -72,7 +73,7 @@ public final class CallableSupplier<T> implements Supplier {
    * Submit a callable into a completable future.
    * RTEs are rethrown.
    * Non RTEs are caught and wrapped; IOExceptions to
-   * {@link WrappedIOException} instances.
+   * {@code RuntimeIOException} instances.
    * @param executor executor.
    * @param call call to invoke
    * @param <T> type
@@ -123,4 +124,34 @@ public final class CallableSupplier<T> implements Supplier {
     }
   }
 
+  /**
+   * Wait for a single of future to complete, ignoring exceptions raised.
+   * @param future future to wait for.
+   */
+  public static <T> void waitForCompletionIgnoringExceptions(
+      @Nullable final CompletableFuture<T> future) {
+    if (future != null) {
+      try (DurationInfo ignore =
+               new DurationInfo(LOG, false, "Waiting for task completion")) {
+        future.join();
+      } catch (Exception e) {
+        LOG.debug("Ignoring exception raised in task completion: ");
+      }
+    }
+  }
+
+  /**
+   * Block awaiting completion for any non-null future passed in;
+   * No-op if a null arg was supplied.
+   * @param future future
+   * @throws IOException if one of the called futures raised an IOE.
+   * @throws RuntimeException if one of the futures raised one.
+   */
+  public static void maybeAwaitCompletion(
+      @Nullable final CompletableFuture<Void> future)
+      throws IOException {
+    if (future != null) {
+      waitForCompletion(future);
+    }
+  }
 }

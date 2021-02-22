@@ -20,6 +20,7 @@ package org.apache.hadoop.hdfs.server.balancer;
 import static org.apache.hadoop.fs.CommonConfigurationKeys.IPC_CLIENT_CONNECT_MAX_RETRIES_ON_SASL_KEY;
 import static org.apache.hadoop.fs.StorageType.DEFAULT;
 import static org.apache.hadoop.fs.StorageType.RAM_DISK;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BALANCER_MAX_SIZE_TO_MOVE_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_HTTPS_KEYSTORE_RESOURCE_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_SERVER_HTTPS_KEYSTORE_RESOURCE_KEY;
 import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_DATA_TRANSFER_PROTECTION_KEY;
@@ -46,6 +47,7 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_WEB_AUTHENTICATION_KERBER
 import static org.apache.hadoop.test.PlatformAssumptions.assumeNotWindows;
 
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
+import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
 import org.junit.AfterClass;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -72,8 +74,11 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang3.StringUtils;
+import org.junit.Before;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
@@ -157,6 +162,16 @@ public class TestBalancer {
   private static MiniKdc kdc;
   private static File keytabFile;
   private MiniDFSCluster cluster;
+  private AtomicInteger numGetBlocksCalls;
+  private AtomicLong startGetBlocksTime;
+  private AtomicLong endGetBlocksTime;
+
+  @Before
+  public void setup() {
+    numGetBlocksCalls = new AtomicInteger(0);
+    startGetBlocksTime = new AtomicLong(Long.MAX_VALUE);
+    endGetBlocksTime = new AtomicLong(Long.MIN_VALUE);
+  }
 
   @After
   public void shutdown() throws Exception {
@@ -791,7 +806,7 @@ public class TestBalancer {
       long newCapacity, String newRack, NewNodeInfo nodes,
       boolean useTool, boolean useFile) throws Exception {
     doTest(conf, capacities, racks, newCapacity, newRack, nodes,
-        useTool, useFile, false);
+        useTool, useFile, false, 0.3);
   }
 
   /** This test start a cluster with specified number of nodes,
@@ -810,12 +825,14 @@ public class TestBalancer {
    * @param useFile - if true, the hosts to included or excluded will be stored in a
    *   file and then later read from the file.
    * @param useNamesystemSpy - spy on FSNamesystem if true
+   * @param clusterUtilization - The utilization of the cluster to start, from
+   *                             0.0 to 1.0
    * @throws Exception
    */
   private void doTest(Configuration conf, long[] capacities,
       String[] racks, long newCapacity, String newRack, NewNodeInfo nodes,
       boolean useTool, boolean useFile,
-      boolean useNamesystemSpy) throws Exception {
+      boolean useNamesystemSpy, double clusterUtilization) throws Exception {
     LOG.info("capacities = " +  long2String(capacities));
     LOG.info("racks      = " +  Arrays.asList(racks));
     LOG.info("newCapacity= " +  newCapacity);
@@ -845,8 +862,8 @@ public class TestBalancer {
 
       long totalCapacity = sum(capacities);
 
-      // fill up the cluster to be 30% full
-      long totalUsedSpace = totalCapacity*3/10;
+      // fill up the cluster to be `clusterUtilization` full
+      long totalUsedSpace = (long) (totalCapacity * clusterUtilization);
       createFile(cluster, filePath, totalUsedSpace / numOfDatanodes,
           (short) numOfDatanodes, 0);
 
@@ -855,6 +872,7 @@ public class TestBalancer {
         cluster.startDataNodes(conf, 1, true, null,
             new String[]{newRack}, null,new long[]{newCapacity});
         totalCapacity += newCapacity;
+        cluster.triggerHeartbeats();
       } else {
         //if running a test with "include list", include original nodes as well
         if (nodes.getNumberofIncludeNodes()>0) {
@@ -871,11 +889,13 @@ public class TestBalancer {
         if (nodes.getNames() != null) {
           cluster.startDataNodes(conf, nodes.getNumberofNewNodes(), true, null,
               newRacks, nodes.getNames(), newCapacities);
-          totalCapacity += newCapacity*nodes.getNumberofNewNodes();
+          cluster.triggerHeartbeats();
+          totalCapacity += newCapacity * nodes.getNumberofNewNodes();
         } else {  // host names are not specified
           cluster.startDataNodes(conf, nodes.getNumberofNewNodes(), true, null,
               newRacks, null, newCapacities);
-          totalCapacity += newCapacity*nodes.getNumberofNewNodes();
+          cluster.triggerHeartbeats();
+          totalCapacity += newCapacity * nodes.getNumberofNewNodes();
           //populate the include nodes
           if (nodes.getNumberofIncludeNodes() > 0) {
             int totalNodes = cluster.getDataNodes().size();
@@ -1000,7 +1020,7 @@ public class TestBalancer {
         for(NameNodeConnector nnc : connectors) {
           final Balancer b = new Balancer(nnc, p, conf);
           final Result r = b.runOneIteration();
-          r.print(iteration, System.out);
+          r.print(iteration, nnc, System.out);
 
           // clean all lists
           b.resetData(conf);
@@ -1890,6 +1910,7 @@ public class TestBalancer {
     // start up an empty node with the same capacity and on the same rack
     cluster.startDataNodes(conf, 1, true, null, new String[] { newRack },
         new long[] { newCapacity });
+    cluster.triggerHeartbeats();
 
     // Case1: Simulate first balancer by creating 'balancer.id' file. It
     // will keep this file until the balancing operation is completed.
@@ -2135,33 +2156,35 @@ public class TestBalancer {
     }
   }
 
-  private static int numGetBlocksCalls;
-  private static long startGetBlocksTime, endGetBlocksTime;
-
   private void spyFSNamesystem(NameNode nn) throws IOException {
     FSNamesystem fsnSpy = NameNodeAdapter.spyOnNamesystem(nn);
-    numGetBlocksCalls = 0;
-    endGetBlocksTime = startGetBlocksTime = Time.monotonicNow();
     doAnswer(new Answer<BlocksWithLocations>() {
       @Override
       public BlocksWithLocations answer(InvocationOnMock invocation)
           throws Throwable {
+        long startTime = Time.monotonicNow();
+        startGetBlocksTime.getAndUpdate((curr) -> Math.min(curr, startTime));
         BlocksWithLocations blk =
             (BlocksWithLocations)invocation.callRealMethod();
-        endGetBlocksTime = Time.monotonicNow();
-        numGetBlocksCalls++;
+        long endTime = Time.monotonicNow();
+        endGetBlocksTime.getAndUpdate((curr) -> Math.max(curr, endTime));
+        numGetBlocksCalls.incrementAndGet();
         return blk;
-      }}).when(fsnSpy).getBlocks(any(DatanodeID.class), anyLong(), anyLong());
+      }}).when(fsnSpy).getBlocks(any(DatanodeID.class),
+        anyLong(), anyLong(), anyLong());
   }
 
   /**
    * Test that makes the Balancer to disperse RPCs to the NameNode
-   * in order to avoid NN's RPC queue saturation.
+   * in order to avoid NN's RPC queue saturation. This not marked as @Test
+   * because it is run from {@link TestBalancerRPCDelay}.
    */
-  void testBalancerRPCDelay() throws Exception {
+  void testBalancerRPCDelay(int getBlocksMaxQps) throws Exception {
     final Configuration conf = new HdfsConfiguration();
     initConf(conf);
     conf.setInt(DFSConfigKeys.DFS_BALANCER_DISPATCHERTHREADS_KEY, 30);
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_GETBLOCKS_MAX_QPS_KEY,
+        getBlocksMaxQps);
 
     int numDNs = 20;
     long[] capacities = new long[numDNs];
@@ -2171,16 +2194,122 @@ public class TestBalancer {
       racks[i] = (i < numDNs/2 ? RACK0 : RACK1);
     }
     doTest(conf, capacities, racks, CAPACITY, RACK2,
-        new PortNumberBasedNodes(3, 0, 0), false, false, true);
+        // Use only 1 node and set the starting capacity to 50% to allow the
+        // balancing to complete in only one iteration. This is necessary
+        // because the startGetBlocksTime and endGetBlocksTime measures across
+        // all get block calls, so if two iterations are performed, the duration
+        // also includes the time it took to perform the block move ops in the
+        // first iteration
+        new PortNumberBasedNodes(1, 0, 0), false, false, true, 0.5);
     assertTrue("Number of getBlocks should be not less than " +
-        Dispatcher.BALANCER_NUM_RPC_PER_SEC,
-        numGetBlocksCalls > Dispatcher.BALANCER_NUM_RPC_PER_SEC);
-    long d = 1 + endGetBlocksTime - startGetBlocksTime;
-    LOG.info("Balancer executed " + numGetBlocksCalls
-        + " getBlocks in " + d + " msec.");
-    assertTrue("Expected BALANCER_NUM_RPC_PER_SEC = " +
-        Dispatcher.BALANCER_NUM_RPC_PER_SEC,
-        (numGetBlocksCalls * 1000 / d) < Dispatcher.BALANCER_NUM_RPC_PER_SEC);
+        getBlocksMaxQps, numGetBlocksCalls.get() >= getBlocksMaxQps);
+    long durationMs = 1 + endGetBlocksTime.get() - startGetBlocksTime.get();
+    int durationSec = (int) Math.ceil(durationMs / 1000.0);
+    LOG.info("Balancer executed {} getBlocks in {} msec (round up to {} sec)",
+        numGetBlocksCalls.get(), durationMs, durationSec);
+    long getBlockCallsPerSecond = numGetBlocksCalls.get() / durationSec;
+    assertTrue("Expected balancer getBlocks calls per second <= " +
+        getBlocksMaxQps, getBlockCallsPerSecond <= getBlocksMaxQps);
+  }
+
+  @Test(timeout = 60000)
+  public void testBalancerWithSortTopNodes() throws Exception {
+    final Configuration conf = new HdfsConfiguration();
+    initConf(conf);
+    conf.setInt(DFS_HEARTBEAT_INTERVAL_KEY, 30000);
+
+    final long capacity = 1000L;
+    final int diffBetweenNodes = 50;
+
+    // Set up the datanodes with two groups:
+    // 5 over-utilized nodes with 80%, 85%, 90%, 95%, 100% usage
+    // 2 under-utilizaed nodes with 0%, 5% usage
+    // With sortTopNodes option, 100% and 95% used ones will be chosen.
+    final int numOfOverUtilizedDn = 5;
+    final int numOfUnderUtilizedDn = 2;
+    final int totalNumOfDn = numOfOverUtilizedDn + numOfUnderUtilizedDn;
+    final long[] capacityArray = new long[totalNumOfDn];
+    Arrays.fill(capacityArray, capacity);
+
+    cluster = new MiniDFSCluster.Builder(conf)
+        .numDataNodes(totalNumOfDn)
+        .simulatedCapacities(capacityArray)
+        .build();
+
+    cluster.setDataNodesDead();
+
+    List<DataNode> dataNodes = cluster.getDataNodes();
+
+    // Create top used nodes
+    for (int i = 0; i < numOfOverUtilizedDn; i++) {
+      // Bring one node alive
+      DataNodeTestUtils.triggerHeartbeat(dataNodes.get(i));
+      DataNodeTestUtils.triggerBlockReport(dataNodes.get(i));
+      // Create nodes with: 80%, 85%, 90%, 95%, 100%.
+      int capacityForThisDatanode = (int)capacity
+          - diffBetweenNodes * (numOfOverUtilizedDn - i - 1);
+      createFile(cluster, new Path("test_big" + i),
+          capacityForThisDatanode, (short) 1, 0);
+      cluster.setDataNodesDead();
+    }
+
+    // Create under utilized nodes
+    for (int i = numOfUnderUtilizedDn - 1; i >= 0; i--) {
+      int index = i + numOfOverUtilizedDn;
+      // Bring one node alive
+      DataNodeTestUtils.triggerHeartbeat(dataNodes.get(index));
+      DataNodeTestUtils.triggerBlockReport(dataNodes.get(index));
+      // Create nodes with: 5%, 0%
+      int capacityForThisDatanode = diffBetweenNodes * i;
+      createFile(cluster,
+          new Path("test_small" + i),
+          capacityForThisDatanode, (short) 1, 0);
+      cluster.setDataNodesDead();
+    }
+
+    // Bring all nodes alive
+    cluster.triggerHeartbeats();
+    cluster.triggerBlockReports();
+    cluster.waitFirstBRCompleted(0, 6000);
+
+    final BalancerParameters p = Balancer.Cli.parse(new String[] {
+        "-policy", BalancingPolicy.Node.INSTANCE.getName(),
+        "-threshold", "1",
+        "-sortTopNodes"
+    });
+
+    client = NameNodeProxies.createProxy(conf,
+        cluster.getFileSystem(0).getUri(),
+        ClientProtocol.class).getProxy();
+
+    // Set max-size-to-move to small number
+    // so only top two nodes will be chosen in one iteration.
+    conf.setLong(DFS_BALANCER_MAX_SIZE_TO_MOVE_KEY, 99L);
+
+    final Collection<URI> namenodes = DFSUtil.getInternalNsRpcUris(conf);
+
+    List<NameNodeConnector> connectors = NameNodeConnector
+        .newNameNodeConnectors(namenodes,
+            Balancer.class.getSimpleName(), Balancer.BALANCER_ID_PATH, conf,
+            BalancerParameters.DEFAULT.getMaxIdleIteration());
+    final Balancer b = new Balancer(connectors.get(0), p, conf);
+    Result balancerResult = b.runOneIteration();
+
+    cluster.triggerDeletionReports();
+    cluster.triggerBlockReports();
+    cluster.triggerHeartbeats();
+
+    DatanodeInfo[] datanodeReport = client
+        .getDatanodeReport(DatanodeReportType.ALL);
+
+    long maxUsage = 0;
+    for (int i = 0; i < totalNumOfDn; i++) {
+      maxUsage = Math.max(maxUsage, datanodeReport[i].getDfsUsed());
+    }
+
+    assertEquals(200, balancerResult.bytesAlreadyMoved);
+    // 100% and 95% used nodes will be balanced, so top used will be 900
+    assertEquals(900, maxUsage);
   }
 
   /**

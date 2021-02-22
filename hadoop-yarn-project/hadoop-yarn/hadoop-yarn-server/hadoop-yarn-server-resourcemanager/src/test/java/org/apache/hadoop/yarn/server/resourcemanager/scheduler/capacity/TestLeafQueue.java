@@ -28,6 +28,7 @@ import static org.apache.hadoop.yarn.server.resourcemanager.scheduler
     .capacity.CapacitySchedulerConfiguration.ROOT;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -45,15 +46,18 @@ import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import com.google.common.collect.ImmutableMap;
+import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.Time;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
@@ -129,7 +133,7 @@ public class TestLeafQueue {
   CapacitySchedulerContext csContext;
   
   CSQueue root;
-  Map<String, CSQueue> queues;
+  private CSQueueStore queues;
   
   final static int GB = 1024;
   final static String DEFAULT_RACK = "/default";
@@ -158,7 +162,8 @@ public class TestLeafQueue {
   private void setUpInternal(ResourceCalculator rC, boolean withNodeLabels)
       throws Exception {
     CapacityScheduler spyCs = new CapacityScheduler();
-    queues = new HashMap<String, CSQueue>();
+    spyCs.setActivitiesManagerEnabled(false);
+    queues = new CSQueueStore();
     cs = spy(spyCs);
     rmContext = TestUtils.getMockRMContext();
     spyRMContext = spy(rmContext);
@@ -456,6 +461,8 @@ public class TestLeafQueue {
 
   @Test
   public void testAppAttemptMetrics() throws Exception {
+    CSMaxRunningAppsEnforcer enforcer = mock(CSMaxRunningAppsEnforcer.class);
+    cs.setMaxRunningAppsEnforcer(enforcer);
 
     // Manipulate queue 'a'
     LeafQueue a = stubLeafQueue((LeafQueue) queues.get(B));
@@ -469,7 +476,7 @@ public class TestLeafQueue {
 
     AppAddedSchedulerEvent addAppEvent =
         new AppAddedSchedulerEvent(appAttemptId_0.getApplicationId(),
-          a.getQueueName(), user_0);
+          a.getQueuePath(), user_0);
     cs.handle(addAppEvent);
     AppAttemptAddedSchedulerEvent addAttemptEvent = 
         new AppAttemptAddedSchedulerEvent(appAttemptId_0, false);
@@ -899,6 +906,645 @@ public class TestLeafQueue {
   }
 
   @Test
+  public void testUserLimitCache() throws Exception {
+    // Parameters
+    final int numNodes = 4;
+    final int nodeSize = 100;
+    final int numAllocationThreads = 2;
+    final int numUsers = 40;
+    final int containerSize = 1 * GB;
+    final int numContainersPerApp = 10;
+    final int runTime = 5000; // in ms
+
+    Random random = new Random();
+
+    // Setup nodes
+    FiCaSchedulerNode[] nodes = new FiCaSchedulerNode[numNodes];
+    Map<NodeId, FiCaSchedulerNode> nodesMap = new HashMap<>(nodes.length);
+    for (int i = 0; i < numNodes; i++) {
+      String host = "127.0.0." + i;
+      FiCaSchedulerNode node = TestUtils.getMockNode(host, DEFAULT_RACK, 0,
+          nodeSize * GB, nodeSize);
+      nodes[i] = node;
+      nodesMap.put(node.getNodeID(), node);
+    }
+
+    Resource clusterResource =
+        Resources.createResource(numNodes * (nodeSize * GB),
+            numNodes * nodeSize);
+
+    when(csContext.getNumClusterNodes()).thenReturn(numNodes);
+    when(csContext.getClusterResource()).thenReturn(clusterResource);
+
+    // working with just one queue
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[]{A});
+    csConf.setCapacity(CapacitySchedulerConfiguration.ROOT + "." + A, 100);
+    csConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + "." + A,
+        100);
+
+    // reinitialize queues
+    CSQueueStore newQueues = new CSQueueStore();
+    CSQueue newRoot =
+        CapacitySchedulerQueueManager.parseQueue(csContext, csConf, null,
+            CapacitySchedulerConfiguration.ROOT,
+            newQueues, queues,
+            TestUtils.spyHook);
+    queues = newQueues;
+    root.reinitialize(newRoot, csContext.getClusterResource());
+    root.updateClusterResource(clusterResource,
+        new ResourceLimits(clusterResource));
+
+    // Mock the queue
+    LeafQueue leafQueue = stubLeafQueue((LeafQueue) queues.get(A));
+
+    // Set user limit factor so some users are at their limit and the
+    // user limit cache has more than just a few entries
+    leafQueue.setUserLimitFactor(10 / nodeSize);
+
+    // Flag to let allocation threads know to stop
+    AtomicBoolean stopThreads = new AtomicBoolean(false);
+    AtomicBoolean errorInThreads = new AtomicBoolean(false);
+
+    // Set up allocation threads
+    Thread[] threads = new Thread[numAllocationThreads];
+    for (int i = 0; i < numAllocationThreads; i++) {
+      threads[i] = new Thread(new Runnable() {
+        @Override
+        public void run() {
+          try {
+            boolean alwaysNull = true;
+            while (!stopThreads.get()) {
+              CSAssignment assignment = leafQueue.assignContainers(
+                  clusterResource,
+                  nodes[random.nextInt(numNodes)],
+                  new ResourceLimits(clusterResource),
+                  SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+              applyCSAssignment(clusterResource, assignment, leafQueue,
+                  nodesMap, leafQueue.applicationAttemptMap);
+
+              if (assignment != CSAssignment.NULL_ASSIGNMENT) {
+                alwaysNull = false;
+              }
+              Thread.sleep(500);
+            }
+
+            // One more assignment but not committing so that the
+            // user limits cache is updated to the latest version
+            CSAssignment assignment = leafQueue.assignContainers(
+                clusterResource,
+                nodes[random.nextInt(numNodes)],
+                new ResourceLimits(clusterResource),
+                SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+
+            if (alwaysNull && assignment == CSAssignment.NULL_ASSIGNMENT) {
+              LOG.error("Thread only got null assignments");
+              errorInThreads.set(true);
+            }
+          } catch (Exception e) {
+            LOG.error("Thread exiting because of exception", e);
+            errorInThreads.set(true);
+          }
+        }
+      }, "Scheduling Thread " + i);
+    }
+
+    // Set up users and some apps
+    final String[] users = new String[numUsers];
+    for (int i = 0; i < users.length; i++) {
+      users[i] = "user_" + i;
+    }
+    List<ApplicationAttemptId> applicationAttemptIds =
+        new ArrayList<>(10);
+    List<FiCaSchedulerApp> apps = new ArrayList<>(10);
+    Priority priority = TestUtils.createMockPriority(1);
+
+    // Start up 10 apps to begin with
+    int appId;
+    for (appId = 0; appId < 10; appId++) {
+      String user = users[random.nextInt(users.length)];
+      ApplicationAttemptId applicationAttemptId =
+          TestUtils.getMockApplicationAttemptId(appId, 0);
+      FiCaSchedulerApp app = new FiCaSchedulerApp(applicationAttemptId,
+          user,
+          leafQueue, leafQueue.getUsersManager(), spyRMContext);
+
+      leafQueue.submitApplicationAttempt(app, user);
+      app.updateResourceRequests(Collections.singletonList(
+          TestUtils.createResourceRequest(ResourceRequest.ANY, containerSize,
+              numContainersPerApp, true, priority, recordFactory)));
+
+      applicationAttemptIds.add(applicationAttemptId);
+      apps.add(app);
+    }
+
+    // Start threads
+    for (int i = 0; i < numAllocationThreads; i++) {
+      threads[i].start();
+    }
+
+    final long startTime = Time.monotonicNow();
+    while (true) {
+      // Start a new app about half the iterations and stop a random app the
+      // rest of the iterations
+      boolean startOrStopApp = random.nextBoolean();
+      if (startOrStopApp || (apps.size() == 1)) {
+        // start a new app
+        String user = users[random.nextInt(users.length)];
+        ApplicationAttemptId applicationAttemptId =
+            TestUtils.getMockApplicationAttemptId(appId, 0);
+        FiCaSchedulerApp app = new FiCaSchedulerApp(applicationAttemptId,
+            user,
+            leafQueue, leafQueue.getUsersManager(), spyRMContext);
+
+        leafQueue.submitApplicationAttempt(app, user);
+        app.updateResourceRequests(Collections.singletonList(
+            TestUtils.createResourceRequest(ResourceRequest.ANY, containerSize,
+                numContainersPerApp, true, priority, recordFactory)));
+
+        applicationAttemptIds.add(applicationAttemptId);
+        apps.add(app);
+
+        appId++;
+      } else {
+        // stop a random app
+        int i = random.nextInt(apps.size());
+        FiCaSchedulerApp app = apps.get(i);
+        leafQueue.finishApplication(app.getApplicationId(), app.getUser());
+        leafQueue.releaseResource(clusterResource, app,
+            app.getCurrentConsumption(), "", null);
+        apps.remove(i);
+        applicationAttemptIds.remove(i);
+      }
+
+      if (errorInThreads.get() || (Time.monotonicNow() - startTime) > runTime) {
+        break;
+      }
+    }
+
+    // signal allocation threads to stop
+    stopThreads.set(true);
+
+    // wait for allocation threads to be done
+    for (int i = 0; i < numAllocationThreads; i++) {
+      threads[i].join();
+    }
+
+    // check if there was an error in the allocation threads
+    assertFalse(errorInThreads.get());
+
+    // check there is only one partition in the user limits cache
+    assertEquals( 1, leafQueue.userLimitsCache.size());
+
+    Map<SchedulingMode, ConcurrentMap<String, LeafQueue.CachedUserLimit>>
+        uLCByPartition = leafQueue.userLimitsCache.get(nodes[0].getPartition());
+
+    // check there is only one scheduling mode
+    assertEquals(uLCByPartition.size(), 1);
+
+    ConcurrentMap<String, LeafQueue.CachedUserLimit> uLCBySchedulingMode =
+        uLCByPartition.get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+
+    // check entries in the user limits cache
+    for (Map.Entry<String, LeafQueue.CachedUserLimit> entry :
+        uLCBySchedulingMode.entrySet()) {
+      String user = entry.getKey();
+      Resource userLimit = entry.getValue().userLimit;
+
+      Resource expectedUL = leafQueue.getResourceLimitForActiveUsers(user,
+          clusterResource, nodes[0].getPartition(),
+          SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+
+      assertEquals(expectedUL, userLimit);
+    }
+
+    // check the current version in the user limits cache
+    assertEquals(leafQueue.getUsersManager().getLatestVersionOfUsersState(),
+        leafQueue.currentUserLimitCacheVersion);
+    assertTrue(leafQueue.currentUserLimitCacheVersion > 0);
+  }
+
+  @Test
+  public void testUserLimitCacheActiveUsersChanged() throws Exception {
+    // Setup some nodes
+    String host_0 = "127.0.0.1";
+    FiCaSchedulerNode node_0 =
+        TestUtils.getMockNode(host_0, DEFAULT_RACK, 0, 6*GB);
+    String host_1 = "127.0.0.2";
+    FiCaSchedulerNode node_1 =
+        TestUtils.getMockNode(host_1, DEFAULT_RACK, 0, 6*GB);
+    String host_2 = "127.0.0.3";
+    FiCaSchedulerNode node_2 =
+        TestUtils.getMockNode(host_2, DEFAULT_RACK, 0, 6*GB);
+    String host_3 = "127.0.0.4";
+    FiCaSchedulerNode node_3 =
+        TestUtils.getMockNode(host_3, DEFAULT_RACK, 0, 6*GB);
+
+    Map<NodeId, FiCaSchedulerNode> nodes =
+        ImmutableMap.of(
+            node_0.getNodeID(), node_0,
+            node_1.getNodeID(), node_1,
+            node_2.getNodeID(), node_2,
+            node_3.getNodeID(), node_3
+        );
+
+    final int numNodes = 4;
+    Resource clusterResource =
+        Resources.createResource(numNodes * (6*GB), numNodes);
+
+    when(csContext.getNumClusterNodes()).thenReturn(numNodes);
+    when(csContext.getClusterResource()).thenReturn(clusterResource);
+
+    // working with just one queue
+    csConf.setQueues(CapacitySchedulerConfiguration.ROOT, new String[] {A});
+    csConf.setCapacity(CapacitySchedulerConfiguration.ROOT + "." + A, 100);
+    csConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + "." + A,
+        100);
+
+    // reinitialize queues
+    CSQueueStore newQueues = new CSQueueStore();
+    CSQueue newRoot =
+        CapacitySchedulerQueueManager.parseQueue(csContext, csConf, null,
+            CapacitySchedulerConfiguration.ROOT,
+            newQueues, queues,
+            TestUtils.spyHook);
+    queues = newQueues;
+    root.reinitialize(newRoot, csContext.getClusterResource());
+    root.updateClusterResource(clusterResource,
+        new ResourceLimits(clusterResource));
+
+    // Mock the queue
+    LeafQueue leafQueue = stubLeafQueue((LeafQueue)queues.get(A));
+
+    // initial check
+    assertEquals(0, leafQueue.userLimitsCache.size());
+    assertEquals(0,
+        leafQueue.getUsersManager().preComputedAllUserLimit.size());
+    assertEquals(0,
+        leafQueue.getUsersManager().preComputedActiveUserLimit.size());
+
+    // 4 users
+    final String user_0 = "user_0";
+    final String user_1 = "user_1";
+    final String user_2 = "user_2";
+    final String user_3 = "user_3";
+
+    // Set user-limit
+    leafQueue.setUserLimit(0);
+    leafQueue.setUserLimitFactor(1.0f);
+
+    Priority priority = TestUtils.createMockPriority(1);
+
+    // Fill queue because user limit is calculated as (used / #active users).
+    final ApplicationAttemptId appAttemptId_9 =
+        TestUtils.getMockApplicationAttemptId(9, 0);
+    FiCaSchedulerApp app_9 =
+        new FiCaSchedulerApp(appAttemptId_9, user_0, leafQueue,
+            leafQueue.getUsersManager(), spyRMContext);
+    leafQueue.submitApplicationAttempt(app_9, user_0);
+
+    Map<ApplicationAttemptId, FiCaSchedulerApp> apps =
+        ImmutableMap.of(app_9.getApplicationAttemptId(), app_9);
+
+    app_9.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_0, 1*GB, 5, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 1*GB, 5, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 1*GB, 5, true,
+            priority, recordFactory)));
+    assertEquals(1, leafQueue.getUsersManager().getNumActiveUsers());
+
+    CSAssignment assignment;
+    for (int i = 0; i < 5; i++) {
+      assignment = leafQueue.assignContainers(clusterResource, node_0,
+          new ResourceLimits(clusterResource),
+          SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+      applyCSAssignment(clusterResource, assignment, leafQueue, nodes, apps);
+    }
+    app_9.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_1, 1*GB, 5, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 1*GB, 5, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 1*GB, 5, true,
+            priority, recordFactory)));
+    for (int i = 0; i < 5; i++) {
+      assignment = leafQueue.assignContainers(clusterResource, node_1,
+          new ResourceLimits(clusterResource),
+          SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+      applyCSAssignment(clusterResource, assignment, leafQueue, nodes, apps);
+    }
+    // A total of 10GB have been allocated
+    assertEquals(10*GB, leafQueue.getUsedResources().getMemorySize());
+    assertEquals(10*GB, app_9.getCurrentConsumption().getMemorySize());
+    // For one user who should have been cached in the assignContainers call
+    assertEquals(1, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .size());
+    // But the cache is stale because an allocation was made
+    assertNotEquals(leafQueue.currentUserLimitCacheVersion,
+        leafQueue.getUsersManager().getLatestVersionOfUsersState());
+    // Have not made any calls to fill up the all user limit in UsersManager
+    assertEquals(0,
+        leafQueue.getUsersManager().preComputedAllUserLimit.size());
+    // But the user limit cache in leafQueue got filled up using the active
+    // user limit in UsersManager
+    assertEquals(1,
+            leafQueue.getUsersManager().preComputedActiveUserLimit.size());
+
+    // submit 3 applications for now
+    final ApplicationAttemptId appAttemptId_0 =
+        TestUtils.getMockApplicationAttemptId(0, 0);
+    FiCaSchedulerApp app_0 =
+        new FiCaSchedulerApp(appAttemptId_0, user_0, leafQueue,
+            leafQueue.getUsersManager(), spyRMContext);
+    leafQueue.submitApplicationAttempt(app_0, user_0);
+
+    final ApplicationAttemptId appAttemptId_1 =
+        TestUtils.getMockApplicationAttemptId(1, 0);
+    FiCaSchedulerApp app_1 =
+        new FiCaSchedulerApp(appAttemptId_1, user_1, leafQueue,
+            leafQueue.getUsersManager(), spyRMContext);
+    leafQueue.submitApplicationAttempt(app_1, user_1);
+
+    final ApplicationAttemptId appAttemptId_2 =
+        TestUtils.getMockApplicationAttemptId(2, 0);
+    FiCaSchedulerApp app_2 =
+        new FiCaSchedulerApp(appAttemptId_2, user_2, leafQueue,
+            leafQueue.getUsersManager(), spyRMContext);
+    leafQueue.submitApplicationAttempt(app_2, user_2);
+
+    apps = ImmutableMap.of(
+        app_0.getApplicationAttemptId(), app_0,
+        app_1.getApplicationAttemptId(), app_1,
+        app_2.getApplicationAttemptId(), app_2
+    );
+
+    // requests from first three users (all of which will be locality delayed)
+    app_0.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_0, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 4*GB, 10, true,
+            priority, recordFactory)));
+
+    app_1.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_0, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 4*GB, 10, true,
+            priority, recordFactory)));
+
+    app_2.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_0, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 4*GB, 10, true,
+            priority, recordFactory)));
+
+    // There are 3 active users right now
+    assertEquals(3, leafQueue.getUsersManager().getNumActiveUsers());
+
+    // fill up user limit cache
+    assignment = leafQueue.assignContainers(clusterResource, node_1,
+        new ResourceLimits(clusterResource),
+        SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+    applyCSAssignment(clusterResource, assignment, leafQueue, nodes, apps);
+    // A total of 10GB have been allocated
+    assertEquals(10*GB, leafQueue.getUsedResources().getMemorySize());
+    assertEquals(0*GB, app_0.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app_1.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app_2.getCurrentConsumption().getMemorySize());
+    assertEquals(10*GB, app_9.getCurrentConsumption().getMemorySize());
+    // There are three users who should have been cached
+    assertEquals(3, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .size());
+    // There are three users so each has a limit of 12/3 = 4GB
+    assertEquals(4*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_0).userLimit.getMemorySize());
+    assertEquals(4*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_1).userLimit.getMemorySize());
+    assertEquals(4*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_2).userLimit.getMemorySize());
+    // And the cache is NOT stale because no allocation was made
+    assertEquals(leafQueue.currentUserLimitCacheVersion,
+        leafQueue.getUsersManager().getLatestVersionOfUsersState());
+    // Have not made any calls to fill up the all user limit in UsersManager
+    assertEquals(0,
+        leafQueue.getUsersManager().preComputedAllUserLimit.size());
+    // But the user limit cache in leafQueue got filled up using the active
+    // user limit in UsersManager with 4GB limit (since there are three users
+    // so 12/3 = 4GB each)
+    assertEquals(1, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.size());
+    assertEquals(1, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.get(RMNodeLabelsManager.NO_LABEL).size());
+    assertEquals(4*GB, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY).getMemorySize());
+
+    // submit the 4th application
+    final ApplicationAttemptId appAttemptId_3 =
+        TestUtils.getMockApplicationAttemptId(3, 0);
+    FiCaSchedulerApp app_3 =
+        new FiCaSchedulerApp(appAttemptId_3, user_3, leafQueue,
+            leafQueue.getUsersManager(), spyRMContext);
+    leafQueue.submitApplicationAttempt(app_3, user_3);
+
+    apps = ImmutableMap.of(
+        app_0.getApplicationAttemptId(), app_0,
+        app_1.getApplicationAttemptId(), app_1,
+        app_2.getApplicationAttemptId(), app_2,
+        app_3.getApplicationAttemptId(), app_3
+    );
+
+    app_3.updateResourceRequests(Arrays.asList(
+        TestUtils.createResourceRequest(host_0, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(DEFAULT_RACK, 4*GB, 1, true,
+            priority, recordFactory),
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 4*GB, 10, true,
+            priority, recordFactory)));
+
+    // 4 active users now
+    assertEquals(4, leafQueue.getUsersManager().getNumActiveUsers());
+    // Check that the user limits cache has become stale
+    assertNotEquals(leafQueue.currentUserLimitCacheVersion,
+        leafQueue.getUsersManager().getLatestVersionOfUsersState());
+
+    // Even though there are no allocations, user limit cache is repopulated
+    assignment = leafQueue.assignContainers(clusterResource, node_1,
+        new ResourceLimits(clusterResource),
+        SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY);
+    applyCSAssignment(clusterResource, assignment, leafQueue, nodes, apps);
+    // A total of 10GB have been allocated
+    assertEquals(10*GB, leafQueue.getUsedResources().getMemorySize());
+    assertEquals(0*GB, app_0.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app_1.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app_2.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app_3.getCurrentConsumption().getMemorySize());
+    assertEquals(10*GB, app_9.getCurrentConsumption().getMemorySize());
+    // There are four users who should have been cached
+    assertEquals(4, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .size());
+    // There are four users so each has a limit of 12/4 = 3GB
+    assertEquals(3*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_0).userLimit.getMemorySize());
+    assertEquals(3*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_1).userLimit.getMemorySize());
+    assertEquals(3*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_2).userLimit.getMemorySize());
+    assertEquals(3*GB, leafQueue.userLimitsCache
+        .get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY)
+        .get(user_3).userLimit.getMemorySize());
+    // And the cache is NOT stale because no allocation was made
+    assertEquals(leafQueue.currentUserLimitCacheVersion,
+        leafQueue.getUsersManager().getLatestVersionOfUsersState());
+    // Have not made any calls to fill up the all user limit in UsersManager
+    assertEquals(0,
+        leafQueue.getUsersManager().preComputedAllUserLimit.size());
+    // But the user limit cache in leafQueue got filled up using the active
+    // user limit in UsersManager with 3GB limit (since there are four users
+    // so 12/4 = 3GB each)
+    assertEquals(1, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.size());
+    assertEquals(1, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.get(RMNodeLabelsManager.NO_LABEL).size());
+    assertEquals(3*GB, leafQueue.getUsersManager()
+        .preComputedActiveUserLimit.get(RMNodeLabelsManager.NO_LABEL)
+        .get(SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY).getMemorySize());
+  }
+
+  @Test
+  public void testDisabledUserLimitFactor() throws Exception {
+    // Mock the queue
+    LeafQueue a = stubLeafQueue((LeafQueue)queues.get(A));
+    //unset maxCapacity
+    a.setMaxCapacity(1.0f);
+
+    when(csContext.getClusterResource())
+        .thenReturn(Resources.createResource(16 * GB, 32));
+
+    // Users
+    final String user0 = "user0";
+    final String user1 = "user1";
+
+    // Submit applications
+    final ApplicationAttemptId appAttemptId0 =
+        TestUtils.getMockApplicationAttemptId(0, 0);
+    FiCaSchedulerApp app0 =
+        new FiCaSchedulerApp(appAttemptId0, user0, a,
+            a.getAbstractUsersManager(), spyRMContext);
+    a.submitApplicationAttempt(app0, user0);
+
+    final ApplicationAttemptId appAttemptId1 =
+        TestUtils.getMockApplicationAttemptId(1, 0);
+    FiCaSchedulerApp app1 =
+        new FiCaSchedulerApp(appAttemptId1, user1, a,
+            a.getAbstractUsersManager(), spyRMContext);
+    a.submitApplicationAttempt(app1, user1); // different user
+
+    // Setup some nodes
+    String host0 = "127.0.0.1";
+    FiCaSchedulerNode node0 =
+        TestUtils.getMockNode(host0, DEFAULT_RACK, 0, 8*GB);
+    String host1 = "127.0.0.2";
+    FiCaSchedulerNode node1 =
+        TestUtils.getMockNode(host1, DEFAULT_RACK, 0, 8*GB);
+
+    final int numNodes = 2;
+    Resource clusterResource =
+        Resources.createResource(numNodes * (8*GB), numNodes * 16);
+    when(csContext.getNumClusterNodes()).thenReturn(numNodes);
+    root.updateClusterResource(clusterResource,
+        new ResourceLimits(clusterResource));
+
+    // Setup resource-requests
+    Priority priority = TestUtils.createMockPriority(1);
+    app0.updateResourceRequests(Collections.singletonList(
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 3*GB, 2, true,
+            priority, recordFactory)));
+
+    app1.updateResourceRequests(Collections.singletonList(
+        TestUtils.createResourceRequest(ResourceRequest.ANY, 1*GB, 2, true,
+            priority, recordFactory)));
+
+    Map<ApplicationAttemptId, FiCaSchedulerApp> apps = ImmutableMap.of(
+        app0.getApplicationAttemptId(), app0, app1.getApplicationAttemptId(),
+        app1);
+    Map<NodeId, FiCaSchedulerNode> nodes = ImmutableMap.of(node0.getNodeID(),
+        node0, node1.getNodeID(), node1);
+
+    /**
+     * Start testing ...
+     */
+    a.setUserLimitFactor(1);
+    a.setUserLimit(50);
+
+    root.updateClusterResource(clusterResource,
+        new ResourceLimits(clusterResource));
+
+    // There're two active users
+    assertEquals(2, a.getAbstractUsersManager().getNumActiveUsers());
+
+    // 1 container to user0
+    applyCSAssignment(clusterResource,
+        a.assignContainers(clusterResource, node0,
+            new ResourceLimits(clusterResource),
+            SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY), a, nodes, apps);
+    assertEquals(3*GB, a.getUsedResources().getMemorySize());
+    assertEquals(3*GB, app0.getCurrentConsumption().getMemorySize());
+    assertEquals(0*GB, app1.getCurrentConsumption().getMemorySize());
+
+    // Allocate one container to app1. Even if app0
+    // submit earlier, it cannot get this container assigned since user0
+    // exceeded user-limit already.
+    applyCSAssignment(clusterResource,
+        a.assignContainers(clusterResource, node0,
+            new ResourceLimits(clusterResource),
+            SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY), a, nodes, apps);
+    assertEquals(4*GB, a.getUsedResources().getMemorySize());
+    assertEquals(3*GB, app0.getCurrentConsumption().getMemorySize());
+    assertEquals(1*GB, app1.getCurrentConsumption().getMemorySize());
+
+    // Set to -1 , disabled user limit factor
+    // There will be not limited
+    a.setUserLimitFactor(-1);
+    root.updateClusterResource(clusterResource,
+        new ResourceLimits(clusterResource));
+
+    applyCSAssignment(clusterResource,
+        a.assignContainers(clusterResource, node1,
+            new ResourceLimits(clusterResource),
+            SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY), a, nodes, apps);
+    assertEquals(7*GB, a.getUsedResources().getMemorySize());
+    assertEquals(6*GB, app0.getCurrentConsumption().getMemorySize());
+    assertEquals(1*GB, app1.getCurrentConsumption().getMemorySize());
+
+  }
+
+  @Test
   public void testUserLimits() throws Exception {
     // Mock the queue
     LeafQueue a = stubLeafQueue((LeafQueue)queues.get(A));
@@ -959,7 +1605,7 @@ public class TestLeafQueue {
     /**
      * Start testing...
      */
-    
+
     // Set user-limit
     a.setUserLimit(50);
     a.setUserLimitFactor(2);
@@ -1237,9 +1883,9 @@ public class TestLeafQueue {
     qb.finishApplication(app_0.getApplicationId(), user_0);
     qb.finishApplication(app_2.getApplicationId(), user_1);
     qb.releaseResource(clusterResource, app_0, Resource.newInstance(4*GB, 1),
-        null, null);
+        "", null);
     qb.releaseResource(clusterResource, app_2, Resource.newInstance(4*GB, 1),
-        null, null);
+        "", null);
 
     qb.setUserLimit(50);
     qb.setUserLimitFactor(1);
@@ -2310,7 +2956,7 @@ public class TestLeafQueue {
     csConf.setInt(CapacitySchedulerConfiguration.NODE_LOCALITY_DELAY, 2);
     csConf.setInt(
         CapacitySchedulerConfiguration.RACK_LOCALITY_ADDITIONAL_DELAY, 1);
-    Map<String, CSQueue> newQueues = new HashMap<String, CSQueue>();
+    CSQueueStore newQueues = new CSQueueStore();
     CSQueue newRoot = CapacitySchedulerQueueManager.parseQueue(csContext,
         csConf, null, ROOT, newQueues, queues,
         TestUtils.spyHook);
@@ -2746,14 +3392,18 @@ public class TestLeafQueue {
         CapacitySchedulerConfiguration.MAXIMUM_APPLICATION_MASTERS_RESOURCE_PERCENT,
         CapacitySchedulerConfiguration.DEFAULT_MAXIMUM_APPLICATIONMASTERS_RESOURCE_PERCENT
             * 2);
-    Map<String, CSQueue> newQueues = new HashMap<String, CSQueue>();
+    CSQueueStore newQueues = new CSQueueStore();
     CSQueue newRoot =
         CapacitySchedulerQueueManager.parseQueue(csContext, csConf, null,
             ROOT,
             newQueues, queues,
             TestUtils.spyHook);
     queues = newQueues;
+    // This will not update active apps
     root.reinitialize(newRoot, csContext.getClusterResource());
+    // Cause this to update active apps
+    root.updateClusterResource(csContext.getClusterResource(),
+        new ResourceLimits(csContext.getClusterResource()));
 
     // after reinitialization
     assertEquals(3, e.getNumActiveApplications());
@@ -2773,7 +3423,7 @@ public class TestLeafQueue {
     csConf.setInt(CapacitySchedulerConfiguration.NODE_LOCALITY_DELAY, 60);
     csConf.setInt(
         CapacitySchedulerConfiguration.RACK_LOCALITY_ADDITIONAL_DELAY, 600);
-    Map<String, CSQueue> newQueues = new HashMap<String, CSQueue>();
+    CSQueueStore newQueues = new CSQueueStore();
     CSQueue newRoot =
         CapacitySchedulerQueueManager.parseQueue(csContext, csConf, null,
             ROOT,
@@ -3120,7 +3770,7 @@ public class TestLeafQueue {
   @Test
   public void testMaxAMResourcePerQueuePercentAfterQueueRefresh()
       throws Exception {
-    Map<String, CSQueue> queues = new HashMap<String, CSQueue>();
+    queues = new CSQueueStore();
     CapacitySchedulerConfiguration csConf = new CapacitySchedulerConfiguration();
     final String newRootName = "root" + System.currentTimeMillis();
     setupQueueConfiguration(csConf, newRootName, false);
@@ -3139,17 +3789,19 @@ public class TestLeafQueue {
     root.updateClusterResource(clusterResource,
         new ResourceLimits(clusterResource));
 
-    // Manipulate queue 'a'
+    // Manipulate queue 'b'
     LeafQueue b = stubLeafQueue((LeafQueue) queues.get(B));
     assertEquals(0.1f, b.getMaxAMResourcePerQueuePercent(), 1e-3f);
-    assertEquals(b.calculateAndGetAMResourceLimit(),
-        Resources.createResource(159 * GB, 1));
+    // Queue b has 100 * 16 = 1600 GB effective usable resource, so the
+    // AM limit is 1600 GB * 0.1 * 0.99 = 162816 MB
+    assertEquals(Resources.createResource(162816, 1),
+        b.calculateAndGetAMResourceLimit());
 
     csConf.setFloat(
         CapacitySchedulerConfiguration.MAXIMUM_APPLICATION_MASTERS_RESOURCE_PERCENT,
         0.2f);
     clusterResource = Resources.createResource(100 * 20 * GB, 100 * 32);
-    Map<String, CSQueue> newQueues = new HashMap<String, CSQueue>();
+    CSQueueStore newQueues = new CSQueueStore();
     CSQueue newRoot = CapacitySchedulerQueueManager.parseQueue(csContext,
         csConf, null, CapacitySchedulerConfiguration.ROOT, newQueues, queues,
         TestUtils.spyHook);
@@ -4130,6 +4782,7 @@ public class TestLeafQueue {
     RMNodeLabelsManager nlm = mock(RMNodeLabelsManager.class);
     when(nlm.getResourceByLabel(any(), any())).thenReturn(res);
     when(rmContext.getNodeLabelManager()).thenReturn(nlm);
+    when(rmContext.getYarnConfiguration()).thenReturn(csConf);
 
     // Queue "test" consumes 100% of the cluster, so its capacity and absolute
     // capacity are both 1.0f.
@@ -4209,14 +4862,17 @@ public class TestLeafQueue {
           leafQueueName, cs.getRootQueue(),
           null);
 
+      leafQueue.updateClusterResource(Resource.newInstance(0, 0),
+          new ResourceLimits(Resource.newInstance(0, 0)));
+
       assertEquals(30, leafQueue.getNodeLocalityDelay());
       assertEquals(20, leafQueue.getMaxApplications());
       assertEquals(2, leafQueue.getMaxApplicationsPerUser());
 
       //check queue configs
-      conf.setMaximumAMResourcePercentPerPartition(leafQueue.getQueueName(),
+      conf.setMaximumAMResourcePercentPerPartition(leafQueue.getQueuePath(),
           NO_LABEL, 10);
-      conf.setMaximumCapacity(leafQueue.getQueueName(), 10);
+      conf.setMaximumCapacity(leafQueue.getQueuePath(), 10);
 
       assertEquals(0.1, leafQueue.getMaxAMResourcePerQueuePercent(),
           EPSILON);

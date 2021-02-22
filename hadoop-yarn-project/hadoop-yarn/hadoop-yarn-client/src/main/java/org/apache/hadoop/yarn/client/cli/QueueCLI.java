@@ -36,7 +36,7 @@ import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 
 @Private
 @Unstable
@@ -128,7 +128,7 @@ public class QueueCLI extends YarnCLI {
 
     writer.print("\tState : ");
     writer.println(queueInfo.getQueueState());
-    DecimalFormat df = new DecimalFormat("#.0");
+    DecimalFormat df = new DecimalFormat("#.00");
     writer.print("\tCapacity : ");
     writer.println(df.format(queueInfo.getCapacity() * 100) + "%");
     writer.print("\tCurrent Capacity : ");

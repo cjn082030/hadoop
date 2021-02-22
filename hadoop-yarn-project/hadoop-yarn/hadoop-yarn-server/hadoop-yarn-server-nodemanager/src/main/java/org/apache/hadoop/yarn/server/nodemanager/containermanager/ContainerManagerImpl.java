@@ -18,8 +18,8 @@
 
 package org.apache.hadoop.yarn.server.nodemanager.containermanager;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.protobuf.ByteString;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.protobuf.ByteString;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.yarn.api.protocolrecords.GetLocalizationStatusesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetLocalizationStatusesResponse;
@@ -212,7 +212,7 @@ public class ContainerManagerImpl extends CompositeService implements
   private final ResourceLocalizationService rsrcLocalizationSrvc;
   private final AbstractContainersLauncher containersLauncher;
   private final AuxServices auxiliaryServices;
-  private final NodeManagerMetrics metrics;
+  @VisibleForTesting final NodeManagerMetrics metrics;
 
   protected final NodeStatusUpdater nodeStatusUpdater;
 
@@ -1082,8 +1082,10 @@ public class ContainerManagerImpl extends CompositeService implements
     ContainerId containerId = containerTokenIdentifier.getContainerID();
     String containerIdStr = containerId.toString();
     String user = containerTokenIdentifier.getApplicationSubmitter();
+    Resource containerResource = containerTokenIdentifier.getResource();
 
-    LOG.info("Start request for " + containerIdStr + " by user " + remoteUser);
+    LOG.info("Start request for " + containerIdStr + " by user " + remoteUser +
+        " with resource " + containerResource);
 
     ContainerLaunchContext launchContext = request.getContainerLaunchContext();
 
@@ -1650,6 +1652,11 @@ public class ContainerManagerImpl extends CompositeService implements
         throws IOException {
       return dirhandlerService.getLocalPathForWrite(path, size, false);
     }
+
+    @Override
+    public Iterable<Path> getAllLocalPathsForRead(String path) throws IOException {
+      return dirhandlerService.getAllLocalPathsForRead(path);
+    }
   }
 
   @SuppressWarnings("unchecked")
@@ -2022,4 +2029,7 @@ public class ContainerManagerImpl extends CompositeService implements
     return container.getLocalizationStatuses();
   }
 
+  public ResourceLocalizationService getResourceLocalizationService() {
+    return rsrcLocalizationSrvc;
+  }
 }

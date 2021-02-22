@@ -20,10 +20,10 @@ package org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugi
 
 import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.resources.ResourcesExceptionUtil.throwIfNecessary;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableSet;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
@@ -136,7 +136,7 @@ public class GpuDiscoverer extends Configured {
     return lastDiscoveredGpuInformation;
   }
 
-  private boolean isAutoDiscoveryEnabled() {
+  boolean isAutoDiscoveryEnabled() {
     String allowedDevicesStr = getConf().get(
         YarnConfiguration.NM_GPU_ALLOWED_DEVICES,
         YarnConfiguration.AUTOMATICALLY_DISCOVER_GPU_DEVICES);
@@ -284,11 +284,12 @@ public class GpuDiscoverer extends Configured {
       binaryPath = configuredBinaryFile;
       // If path exists but file name is incorrect don't execute the file
       String fileName = binaryPath.getName();
-      if (DEFAULT_BINARY_NAME.equals(fileName)) {
+      if (!DEFAULT_BINARY_NAME.equals(fileName)) {
         String msg = String.format("Please check the configuration value of"
-             +" %s. It should point to an %s binary.",
+             +" %s. It should point to an %s binary, which is now %s",
              YarnConfiguration.NM_GPU_PATH_TO_EXEC,
-             DEFAULT_BINARY_NAME);
+             DEFAULT_BINARY_NAME,
+             fileName);
         throwIfNecessary(new YarnException(msg), config);
         LOG.warn(msg);
       }

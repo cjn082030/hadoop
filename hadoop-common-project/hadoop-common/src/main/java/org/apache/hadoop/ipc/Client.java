@@ -18,9 +18,10 @@
 
 package org.apache.hadoop.ipc;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceAudience.Public;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -53,8 +54,8 @@ import org.apache.hadoop.util.ProtoUtil;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.util.concurrent.AsyncGet;
-import org.apache.htrace.core.Span;
-import org.apache.htrace.core.Tracer;
+import org.apache.hadoop.tracing.Span;
+import org.apache.hadoop.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -649,6 +650,7 @@ public class Client implements AutoCloseable {
     
     private synchronized void setupConnection(
         UserGroupInformation ticket) throws IOException {
+      LOG.debug("Setup connection to " + server.toString());
       short ioFailures = 0;
       short timeoutFailures = 0;
       while (true) {
@@ -711,8 +713,16 @@ public class Client implements AutoCloseable {
         } catch (IOException ie) {
           if (updateAddress()) {
             timeoutFailures = ioFailures = 0;
+            try {
+              // HADOOP-17068: when server changed, ignore the exception.
+              handleConnectionFailure(ioFailures++, ie);
+            } catch (IOException ioe) {
+              LOG.warn("Exception when handle ConnectionFailure: "
+                  + ioe.getMessage());
+            }
+          } else {
+            handleConnectionFailure(ioFailures++, ie);
           }
-          handleConnectionFailure(ioFailures++, ie);
         }
       }
     }
@@ -761,8 +771,17 @@ public class Client implements AutoCloseable {
               throw (IOException) new IOException(msg).initCause(ex);
             }
           } else {
-            LOG.warn("Exception encountered while connecting to "
-                + "the server : " + ex);
+            // With RequestHedgingProxyProvider, one rpc call will send multiple
+            // requests to all namenodes. After one request return successfully,
+            // all other requests will be interrupted. It's not a big problem,
+            // and should not print a warning log.
+            if (ex instanceof InterruptedIOException) {
+              LOG.debug("Exception encountered while connecting to the server",
+                  ex);
+            } else {
+              LOG.warn("Exception encountered while connecting to the server ",
+                  ex);
+            }
           }
           if (ex instanceof RemoteException)
             throw (RemoteException) ex;
@@ -839,7 +858,8 @@ public class Client implements AutoCloseable {
               }
             } else if (UserGroupInformation.isSecurityEnabled()) {
               if (!fallbackAllowed) {
-                throw new IOException("Server asks us to fall back to SIMPLE " +
+                throw new AccessControlException(
+                    "Server asks us to fall back to SIMPLE " +
                     "auth, but this client is configured to only allow secure " +
                     "connections.");
               }
@@ -1268,7 +1288,7 @@ public class Client implements AutoCloseable {
           cleanupCalls();
         }
       } else {
-        // log the info
+        // Log the newest server information if update address.
         if (LOG.isDebugEnabled()) {
           LOG.debug("closing ipc connection to " + server + ": " +
               closeException.getMessage(),closeException);

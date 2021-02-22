@@ -83,8 +83,8 @@ import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
 
 /** Dispatching block replica moves between datanodes. */
 @InterfaceAudience.Private
@@ -128,6 +128,7 @@ public class Dispatcher {
   private final long getBlocksSize;
   private final long getBlocksMinBlockSize;
   private final long blockMoveTimeout;
+  private final long hotBlockTimeInterval;
   /**
    * If no block can be moved out of a {@link Source} after this configured
    * amount of time, the Source should give up choosing the next possible move.
@@ -392,7 +393,7 @@ public class Dispatcher {
 
         sendRequest(out, eb, accessToken);
         receiveResponse(in);
-        nnc.getBytesMoved().addAndGet(reportedBlock.getNumBytes());
+        nnc.addBytesMoved(reportedBlock.getNumBytes());
         target.getDDatanode().setHasSuccess();
         LOG.info("Successfully moved " + this);
       } catch (IOException e) {
@@ -797,7 +798,8 @@ public class Dispatcher {
     private long getBlockList() throws IOException {
       final long size = Math.min(getBlocksSize, blocksToReceive);
       final BlocksWithLocations newBlksLocs =
-          nnc.getBlocks(getDatanodeInfo(), size, getBlocksMinBlockSize);
+          nnc.getBlocks(getDatanodeInfo(), size, getBlocksMinBlockSize,
+              hotBlockTimeInterval);
 
       if (LOG.isTraceEnabled()) {
         LOG.trace("getBlocks(" + getDatanodeInfo() + ", "
@@ -928,10 +930,8 @@ public class Dispatcher {
      * move tasks or it has received enough blocks from the namenode, or the
      * elapsed time of the iteration has exceeded the max time limit.
      *
-     * @param delay - time to sleep before sending getBlocks. Intended to
-     * disperse Balancer RPCs to NameNode for large clusters. See HDFS-11384.
      */
-    private void dispatchBlocks(long delay) {
+    private void dispatchBlocks() {
       this.blocksToReceive = 2 * getScheduledSize();
       long previousMoveTimestamp = Time.monotonicNow();
       while (getScheduledSize() > 0 && !isIterationOver()
@@ -956,25 +956,15 @@ public class Dispatcher {
         if (shouldFetchMoreBlocks()) {
           // fetch new blocks
           try {
-            if(delay > 0) {
-              if (LOG.isDebugEnabled()) {
-                LOG.debug("Sleeping " + delay + "  msec.");
-              }
-              Thread.sleep(delay);
-            }
             final long received = getBlockList();
             if (received == 0) {
               return;
             }
             blocksToReceive -= received;
             continue;
-          } catch (InterruptedException ignored) {
-            // nothing to do
           } catch (IOException e) {
             LOG.warn("Exception while getting reportedBlock list", e);
             return;
-          } finally {
-            delay = 0L;
           }
         } else {
           // jump out of while-loop after the configured timeout.
@@ -1023,14 +1013,15 @@ public class Dispatcher {
       int maxNoMoveInterval, Configuration conf) {
     this(nnc, includedNodes, excludedNodes, movedWinWidth,
         moverThreads, dispatcherThreads, maxConcurrentMovesPerNode,
-        0L, 0L, 0, maxNoMoveInterval, -1, conf);
+        0L, 0L, 0, maxNoMoveInterval, -1, 0, conf);
   }
 
   Dispatcher(NameNodeConnector nnc, Set<String> includedNodes,
       Set<String> excludedNodes, long movedWinWidth, int moverThreads,
       int dispatcherThreads, int maxConcurrentMovesPerNode,
       long getBlocksSize, long getBlocksMinBlockSize, int blockMoveTimeout,
-      int maxNoMoveInterval, long maxIterationTime, Configuration conf) {
+      int maxNoMoveInterval, long maxIterationTime, long hotBlockTimeInterval,
+      Configuration conf) {
     this.nnc = nnc;
     this.excludedNodes = excludedNodes;
     this.includedNodes = includedNodes;
@@ -1046,6 +1037,7 @@ public class Dispatcher {
 
     this.getBlocksSize = getBlocksSize;
     this.getBlocksMinBlockSize = getBlocksMinBlockSize;
+    this.hotBlockTimeInterval = hotBlockTimeInterval;
     this.blockMoveTimeout = blockMoveTimeout;
     this.maxNoMoveInterval = maxNoMoveInterval;
 
@@ -1076,6 +1068,10 @@ public class Dispatcher {
     return nnc.getBytesMoved().get();
   }
 
+  long getBblocksMoved() {
+    return nnc.getBlocksMoved().get();
+  }
+
   long bytesToMove() {
     Preconditions.checkState(
         storageGroupMap.size() >= sources.size() + targets.size(),
@@ -1093,6 +1089,14 @@ public class Dispatcher {
   void add(Source source, StorageGroup target) {
     sources.add(source);
     targets.add(target);
+  }
+
+  public int moveTasksTotal() {
+    int b = 0;
+    for (Source src : sources) {
+      b += src.tasks.size();
+    }
+    return b;
   }
 
   private boolean shouldIgnore(DatanodeInfo dn) {
@@ -1167,12 +1171,6 @@ public class Dispatcher {
   }
 
   /**
-   * The best-effort limit on the number of RPCs per second
-   * the Balancer will send to the NameNode.
-   */
-  final static int BALANCER_NUM_RPC_PER_SEC = 20;
-
-  /**
    * Dispatch block moves for each source. The thread selects blocks to move &
    * sends request to proxy source to initiate block move. The process is flow
    * controlled. Block selection is blocked if there are too many un-confirmed
@@ -1182,17 +1180,13 @@ public class Dispatcher {
    */
   private long dispatchBlockMoves() throws InterruptedException {
     final long bytesLastMoved = getBytesMoved();
+    final long blocksLastMoved = getBblocksMoved();
     final Future<?>[] futures = new Future<?>[sources.size()];
 
     int concurrentThreads = Math.min(sources.size(),
         ((ThreadPoolExecutor)dispatchExecutor).getCorePoolSize());
     assert concurrentThreads > 0 : "Number of concurrent threads is 0.";
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Balancer allowed RPCs per sec = " + BALANCER_NUM_RPC_PER_SEC);
-      LOG.debug("Balancer concurrent threads = " + concurrentThreads);
-      LOG.debug("Disperse Interval sec = " +
-          concurrentThreads / BALANCER_NUM_RPC_PER_SEC);
-    }
+    LOG.info("Balancer concurrent dispatcher threads = {}", concurrentThreads);
 
     // Determine the size of each mover thread pool per target
     int threadsPerTarget = maxMoverThreads/targets.size();
@@ -1212,23 +1206,15 @@ public class Dispatcher {
       LOG.info("Allocating " + threadsPerTarget + " threads per target.");
     }
 
-    long dSec = 0;
     final Iterator<Source> i = sources.iterator();
     for (int j = 0; j < futures.length; j++) {
       final Source s = i.next();
-      final long delay = dSec * 1000;
       futures[j] = dispatchExecutor.submit(new Runnable() {
         @Override
         public void run() {
-          s.dispatchBlocks(delay);
+          s.dispatchBlocks();
         }
       });
-      // Calculate delay in seconds for the next iteration
-      if(j >= concurrentThreads) {
-        dSec = 0;
-      } else if((j + 1) % BALANCER_NUM_RPC_PER_SEC == 0) {
-        dSec++;
-      }
     }
 
     // wait for all dispatcher threads to finish
@@ -1242,6 +1228,9 @@ public class Dispatcher {
 
     // wait for all reportedBlock moving to be done
     waitForMoveCompletion(targets);
+    LOG.info("Total bytes (blocks) moved in this iteration {} ({})",
+        StringUtils.byteDesc(getBytesMoved() - bytesLastMoved),
+        (getBblocksMoved() - blocksLastMoved));
 
     return getBytesMoved() - bytesLastMoved;
   }

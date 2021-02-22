@@ -72,8 +72,8 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.google.common.base.Supplier;
-import com.google.common.collect.Lists;
+import java.util.function.Supplier;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
 
 /**
  * Tests that exercise safemode in an HA cluster.
@@ -88,7 +88,7 @@ public class TestHASafeMode {
   private MiniDFSCluster cluster;
   
   static {
-    DFSTestUtil.setNameNodeLogLevel(org.apache.log4j.Level.TRACE);
+    DFSTestUtil.setNameNodeLogLevel(Level.TRACE);
     GenericTestUtils.setLogLevel(FSImage.LOG, Level.TRACE);
   }
   
@@ -497,7 +497,15 @@ public class TestHASafeMode {
   private static void assertSafeMode(NameNode nn, int safe, int total,
     int numNodes, int nodeThresh) {
     String status = nn.getNamesystem().getSafemode();
-    if (safe == total) {
+    if (total == 0 && nodeThresh == 0) {
+      assertTrue("Bad safemode status: '" + status + "'",
+          status.isEmpty()
+              || status.startsWith("Safe mode is ON. The reported blocks 0 " +
+              "has reached the threshold 0.9990 of total blocks 0. The " +
+              "minimum number of live datanodes is not required. In safe " +
+              "mode extension. Safe mode will be turned off automatically " +
+              "in 0 seconds."));
+    } else if (safe == total) {
       if (nodeThresh == 0) {
         assertTrue("Bad safemode status: '" + status + "'",
             status.startsWith("Safe mode is ON. The reported blocks " + safe

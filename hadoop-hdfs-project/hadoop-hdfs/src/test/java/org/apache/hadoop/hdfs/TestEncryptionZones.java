@@ -35,6 +35,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -42,7 +43,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import com.google.common.collect.Lists;
+import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CipherSuite;
@@ -62,6 +64,7 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileSystemTestHelper;
 import org.apache.hadoop.fs.FileSystemTestWrapper;
+import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.FsShell;
 import org.apache.hadoop.fs.Path;
@@ -101,8 +104,6 @@ import org.apache.hadoop.util.ToolRunner;
 import org.apache.hadoop.crypto.key.KeyProviderDelegationTokenExtension.DelegationTokenExtension;
 import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension.CryptoExtension;
 import org.apache.hadoop.io.Text;
-import org.apache.log4j.Level;
-import org.apache.log4j.Logger;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -144,6 +145,9 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 import org.xml.sax.InputSource;
 import org.xml.sax.helpers.DefaultHandler;
 
@@ -151,7 +155,7 @@ import javax.xml.parsers.SAXParser;
 import javax.xml.parsers.SAXParserFactory;
 
 public class TestEncryptionZones {
-  static final Logger LOG = Logger.getLogger(TestEncryptionZones.class);
+  static final Logger LOG = LoggerFactory.getLogger(TestEncryptionZones.class);
 
   protected Configuration conf;
   private FileSystemTestHelper fsHelper;
@@ -195,7 +199,8 @@ public class TestEncryptionZones {
         2);
     cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
     cluster.waitActive();
-    Logger.getLogger(EncryptionZoneManager.class).setLevel(Level.TRACE);
+    GenericTestUtils.setLogLevel(
+        LoggerFactory.getLogger(EncryptionZoneManager.class), Level.TRACE);
     fs = cluster.getFileSystem();
     fsWrapper = new FileSystemTestWrapper(fs);
     fcWrapper = new FileContextTestWrapper(
@@ -322,6 +327,72 @@ public class TestEncryptionZones {
         return null;
       }
     });
+  }
+
+  /**
+   * Tests encrypted files with same original content placed in two different
+   * EZ are not same in encrypted form.
+   */
+  @Test
+  public void testEncryptionZonesDictCp() throws Exception {
+    final String testkey1 = "testkey1";
+    final String testkey2 = "testkey2";
+    DFSTestUtil.createKey(testkey1, cluster, conf);
+    DFSTestUtil.createKey(testkey2, cluster, conf);
+
+    final int len = 8196;
+    final Path zone1 = new Path("/zone1");
+    final Path zone1File = new Path(zone1, "file");
+    final Path raw1File = new Path("/.reserved/raw/zone1/file");
+
+    final Path zone2 = new Path("/zone2");
+    final Path zone2File = new Path(zone2, "file");
+    final Path raw2File = new Path(zone2, "/.reserved/raw/zone2/file");
+
+    // 1. Create two encrypted zones
+    fs.mkdirs(zone1, new FsPermission(700));
+    dfsAdmin.createEncryptionZone(zone1, testkey1, NO_TRASH);
+
+    fs.mkdirs(zone2, new FsPermission(700));
+    dfsAdmin.createEncryptionZone(zone2, testkey2, NO_TRASH);
+
+    // 2. Create a file in one of the zones
+    DFSTestUtil.createFile(fs, zone1File, len, (short) 1, 0xFEED);
+    // 3. Copy it to the other zone through /.raw/reserved
+    FileUtil.copy(fs, raw1File, fs, raw2File, false, conf);
+    Map<String, byte[]> attrs = fs.getXAttrs(raw1File);
+    if (attrs != null) {
+      for (Map.Entry<String, byte[]> entry : attrs.entrySet()) {
+        String xattrName = entry.getKey();
+
+        try {
+          fs.setXAttr(raw2File, xattrName, entry.getValue());
+          fail("Exception should be thrown while setting: " +
+                  xattrName + " on file:" + raw2File);
+        } catch (RemoteException e) {
+          Assert.assertEquals(e.getClassName(),
+                  IllegalArgumentException.class.getCanonicalName());
+          Assert.assertTrue(e.getMessage().
+                  contains("does not belong to the key"));
+        }
+      }
+    }
+
+    assertEquals("File can be created on the root encryption zone " +
+            "with correct length", len, fs.getFileStatus(zone1File).getLen());
+    assertTrue("/zone1 dir is encrypted",
+            fs.getFileStatus(zone1).isEncrypted());
+    assertTrue("File is encrypted", fs.getFileStatus(zone1File).isEncrypted());
+
+    assertTrue("/zone2 dir is encrypted",
+            fs.getFileStatus(zone2).isEncrypted());
+    assertTrue("File is encrypted", fs.getFileStatus(zone2File).isEncrypted());
+
+    // 4. Now the decrypted contents of the files should be different.
+    DFSTestUtil.verifyFilesNotEqual(fs, zone1File, zone2File, len);
+
+    // 5. Encrypted contents of the files should be same.
+    DFSTestUtil.verifyFilesEqual(fs, raw1File, raw2File, len);
   }
 
   /**
@@ -983,6 +1054,8 @@ public class TestEncryptionZones {
     noCodecConf.set(confKey, "");
     fs.dfs = new DFSClient(null, mcp, noCodecConf, null);
     mockCreate(mcp, suite, CryptoProtocolVersion.ENCRYPTION_ZONES);
+    Mockito.when(mcp.complete(anyString(), anyString(), any(), anyLong()))
+        .thenReturn(true);
     try {
       fs.create(new Path("/mock"));
       fail("Created with no configured codecs!");

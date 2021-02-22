@@ -97,7 +97,6 @@ import org.apache.hadoop.yarn.sls.utils.SLSUtils;
 import org.apache.hadoop.yarn.util.UTCClock;
 import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.resource.Resources;
-import org.eclipse.jetty.util.ConcurrentHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -144,6 +143,8 @@ public class SLSRunner extends Configured implements Tool {
 
   private static boolean exitAtTheFinish = false;
 
+  private static final String DEFAULT_USER = "default";
+
   /**
    * The type of trace in input.
    */
@@ -157,6 +158,10 @@ public class SLSRunner extends Configured implements Tool {
 
   private TraceType inputType;
   private SynthTraceJobProducer stjp;
+
+  public static int getRemainingApps() {
+    return remainingApps;
+  }
 
   public SLSRunner() throws ClassNotFoundException {
     Configuration tempConf = new Configuration(false);
@@ -371,7 +376,7 @@ public class SLSRunner extends Configured implements Tool {
 
     // create NM simulators
     Random random = new Random();
-    Set<String> rackSet = new ConcurrentHashSet<>();
+    Set<String> rackSet = ConcurrentHashMap.newKeySet();
     int threadPoolSize = Math.max(poolSize,
         SLSConfiguration.RUNNER_POOL_SIZE_DEFAULT);
     ExecutorService executorService = Executors.
@@ -733,7 +738,8 @@ public class SLSRunner extends Configured implements Tool {
     // creation
     while ((job = (SynthJob) stjp.getNextJob()) != null) {
       // only support MapReduce currently
-      String user = job.getUser();
+      String user = job.getUser() == null ? DEFAULT_USER :
+              job.getUser();
       String jobQueue = job.getQueueName();
       String oldJobId = job.getJobID().toString();
       long jobStartTimeMS = job.getSubmissionTime();
@@ -814,7 +820,7 @@ public class SLSRunner extends Configured implements Tool {
     if (appNum == null) {
       appNum = 1;
     } else {
-      appNum++;
+      appNum = appNum + 1;
     }
 
     queueAppNumMap.put(queueName, appNum);
@@ -931,12 +937,12 @@ public class SLSRunner extends Configured implements Tool {
 
   public static void decreaseRemainingApps() {
     remainingApps--;
+  }
 
-    if (remainingApps == 0) {
-      LOG.info("SLSRunner tears down.");
-      if (exitAtTheFinish) {
-        System.exit(0);
-      }
+  public static void exitSLSRunner() {
+    LOG.info("SLSRunner tears down.");
+    if (exitAtTheFinish) {
+      System.exit(0);
     }
   }
 

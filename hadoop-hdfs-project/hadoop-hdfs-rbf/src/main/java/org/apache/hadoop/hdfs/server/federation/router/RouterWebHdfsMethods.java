@@ -115,20 +115,18 @@ public class RouterWebHdfsMethods extends NamenodeWebHdfsMethods {
   private static final Logger LOG =
       LoggerFactory.getLogger(RouterWebHdfsMethods.class);
 
-  private static final ThreadLocal<String> REMOTE_ADDRESS =
-      new ThreadLocal<String>();
-
   private @Context HttpServletRequest request;
   private String method;
   private String query;
   private String reqPath;
+  private String remoteAddr;
 
   public RouterWebHdfsMethods(@Context HttpServletRequest request) {
     super(request);
     this.method = request.getMethod();
     this.query = request.getQueryString();
     this.reqPath = request.getServletPath();
-    REMOTE_ADDRESS.set(JspHelper.getRemoteAddr(request));
+    this.remoteAddr = JspHelper.getRemoteAddr(request);
   }
 
   @Override
@@ -139,7 +137,7 @@ public class RouterWebHdfsMethods extends NamenodeWebHdfsMethods {
                       final Param<?, ?>... parameters) {
     super.init(ugi, delegation, username, doAsUser, path, op, parameters);
 
-    REMOTE_ADDRESS.set(JspHelper.getRemoteAddr(request));
+    remoteAddr = JspHelper.getRemoteAddr(request);
   }
 
   @Override
@@ -153,12 +151,12 @@ public class RouterWebHdfsMethods extends NamenodeWebHdfsMethods {
   }
 
   private void reset() {
-    REMOTE_ADDRESS.set(null);
+    remoteAddr = null;
   }
 
   @Override
   protected String getRemoteAddr() {
-    return REMOTE_ADDRESS.get();
+    return remoteAddr;
   }
 
   @Override
@@ -454,19 +452,12 @@ public class RouterWebHdfsMethods extends NamenodeWebHdfsMethods {
   private DatanodeInfo chooseDatanode(final Router router,
       final String path, final HttpOpParam.Op op, final long openOffset,
       final String excludeDatanodes) throws IOException {
-    // We need to get the DNs as a privileged user
     final RouterRpcServer rpcServer = getRPCServer(router);
-    UserGroupInformation loginUser = UserGroupInformation.getLoginUser();
-    RouterRpcServer.setCurrentUser(loginUser);
-
     DatanodeInfo[] dns = null;
     try {
-      dns = rpcServer.getDatanodeReport(DatanodeReportType.LIVE);
+      dns = rpcServer.getCachedDatanodeReport(DatanodeReportType.LIVE);
     } catch (IOException e) {
       LOG.error("Cannot get the datanodes from the RPC server", e);
-    } finally {
-      // Reset ugi to remote user for remaining operations.
-      RouterRpcServer.resetCurrentUser();
     }
 
     HashSet<Node> excludes = new HashSet<Node>();

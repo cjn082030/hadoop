@@ -18,7 +18,11 @@
 
 cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
 
+project(hadoop_hdfs_native_client)
+
 enable_testing()
+
+set(CMAKE_CXX_STANDARD 17)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/../../../hadoop-common-project/hadoop-common)
 include(HadoopCommon)
@@ -151,7 +155,8 @@ add_subdirectory(main/native/libhdfs-examples)
 # Temporary fix to disable Libhdfs++ build on older systems that do not support thread_local
 include(CheckCXXSourceCompiles)
 unset (THREAD_LOCAL_SUPPORTED CACHE)
-set (CMAKE_REQUIRED_DEFINITIONS "-std=c++11")
+set (CMAKE_CXX_STANDARD 11)
+set (CMAKE_CXX_STANDARD_REQUIRED ON)
 set (CMAKE_REQUIRED_LIBRARIES ${CMAKE_THREAD_LIBS_INIT})
 check_cxx_source_compiles(
     "#include <thread>

@@ -30,7 +30,7 @@ import com.amazonaws.ClientConfiguration;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSSessionCredentials;
 import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -226,7 +226,7 @@ public class SessionTokenBinding extends AbstractDelegationTokenBinding {
         "Session Token Binding",
         new MarshalledCredentialProvider(
             SESSION_TOKEN,
-            getFileSystem().getUri(),
+            getStoreContext().getFsURI(),
             getConfig(),
             marshalledCredentials,
             MarshalledCredentials.CredentialTypeRequired.SessionOnly));
@@ -353,7 +353,8 @@ public class SessionTokenBinding extends AbstractDelegationTokenBinding {
   @Retries.RetryTranslated
   public SessionTokenIdentifier createTokenIdentifier(
       final Optional<RoleModel.Policy> policy,
-      final EncryptionSecrets encryptionSecrets) throws IOException {
+      final EncryptionSecrets encryptionSecrets,
+      final Text renewer) throws IOException {
     requireServiceStarted();
 
     final MarshalledCredentials marshalledCredentials;
@@ -384,11 +385,12 @@ public class SessionTokenBinding extends AbstractDelegationTokenBinding {
       }
     }
     return new SessionTokenIdentifier(getKind(),
-        getOwnerText(),
-        getCanonicalUri(),
-        marshalledCredentials,
-        encryptionSecrets,
-        origin);
+         getOwnerText(),
+         renewer,
+         getCanonicalUri(),
+         marshalledCredentials,
+         encryptionSecrets,
+         origin);
   }
 
   @Override

@@ -17,8 +17,9 @@
  */
 package org.apache.hadoop.yarn.server.resourcemanager.monitor.capacity;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ImmutableSet;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableSet;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -409,9 +410,11 @@ public class ProportionalCapacityPreemptionPolicy
   }
 
   private Set<String> getLeafQueueNames(TempQueuePerPartition q) {
-    // If its a ManagedParentQueue, it might not have any children
-    if ((q.children == null || q.children.isEmpty())
-        && !(q.parentQueue instanceof ManagedParentQueue)) {
+    // Also exclude ParentQueues, which might be without children
+    if (CollectionUtils.isEmpty(q.children)
+        && !(q.parentQueue instanceof ManagedParentQueue)
+        && (q.parentQueue == null
+        || !q.parentQueue.isEligibleForAutoQueueCreation())) {
       return ImmutableSet.of(q.queueName);
     }
 
@@ -567,7 +570,7 @@ public class ProportionalCapacityPreemptionPolicy
     // Acquire a read lock from Parent/LeafQueue.
     readLock.lock();
     try {
-      String queueName = curQueue.getQueueName();
+      String queuePath = curQueue.getQueuePath();
       QueueCapacities qc = curQueue.getQueueCapacities();
       float absCap = qc.getAbsoluteCapacity(partitionToLookAt);
       float absMaxCap = qc.getAbsoluteMaximumCapacity(partitionToLookAt);
@@ -586,8 +589,8 @@ public class ProportionalCapacityPreemptionPolicy
 
       Resource reserved = Resources.clone(
           curQueue.getQueueResourceUsage().getReserved(partitionToLookAt));
-      if (null != preemptableQueues.get(queueName)) {
-        killable = Resources.clone(preemptableQueues.get(queueName)
+      if (null != preemptableQueues.get(queuePath)) {
+        killable = Resources.clone(preemptableQueues.get(queuePath)
             .getKillableResource(partitionToLookAt));
       }
 
@@ -603,7 +606,7 @@ public class ProportionalCapacityPreemptionPolicy
         // just ignore the error, this will be corrected when doing next check.
       }
 
-      ret = new TempQueuePerPartition(queueName, current, preemptionDisabled,
+      ret = new TempQueuePerPartition(queuePath, current, preemptionDisabled,
           partitionToLookAt, killable, absCap, absMaxCap, partitionResource,
           reserved, curQueue, effMinRes, effMaxRes);
 

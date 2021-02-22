@@ -18,7 +18,7 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
 
-import com.google.common.collect.Sets;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -121,6 +121,7 @@ public class TestUtils {
           }
         });
 
+    rmContext.setYarnConfiguration(conf);
     rmContext.setNodeLabelManager(nlm);
     rmContext.setSystemMetricsPublisher(mock(SystemMetricsPublisher.class));
     rmContext.setRMApplicationHistoryWriter(mock(RMApplicationHistoryWriter.class));
@@ -465,24 +466,5 @@ public class TestUtils {
 
     cs.submitResourceCommitRequest(clusterResource,
         csAssignment);
-  }
-
-  /**
-   * An easy way to create resources other than memory and vcores for tests.
-   * @param memory memory
-   * @param vcores vcores
-   * @param nameToValues resource types other than memory and vcores.
-   * @return created resource
-   */
-  public static Resource createResource(long memory, int vcores,
-      Map<String, Integer> nameToValues) {
-    Resource res = Resource.newInstance(memory, vcores);
-    if (nameToValues != null) {
-      for (Map.Entry<String, Integer> entry : nameToValues.entrySet()) {
-        res.setResourceInformation(entry.getKey(), ResourceInformation
-            .newInstance(entry.getKey(), "", entry.getValue()));
-      }
-    }
-    return res;
   }
 }

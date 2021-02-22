@@ -54,6 +54,8 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.SchedulerEv
 import org.apache.hadoop.yarn.sls.SLSRunner;
 import org.apache.hadoop.yarn.sls.conf.SLSConfiguration;
 import org.apache.hadoop.yarn.util.resource.Resources;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.codahale.metrics.Timer;
 
@@ -74,6 +76,9 @@ public class SLSCapacityScheduler extends CapacityScheduler implements
   private SchedulerMetrics schedulerMetrics;
   private boolean metricsON;
   private Tracker tracker;
+
+  // logger
+  private static final Logger LOG = LoggerFactory.getLogger(SLSCapacityScheduler.class);
 
   public Tracker getTracker() {
     return tracker;
@@ -218,6 +223,14 @@ public class SLSCapacityScheduler extends CapacityScheduler implements
         AppAttemptRemovedSchedulerEvent appRemoveEvent =
             (AppAttemptRemovedSchedulerEvent) schedulerEvent;
         appQueueMap.remove(appRemoveEvent.getApplicationAttemptID());
+        if (SLSRunner.getRemainingApps() == 0) {
+          try {
+            getSchedulerMetrics().tearDown();
+            SLSRunner.exitSLSRunner();
+          } catch (Exception e) {
+            LOG.error("Scheduler Metrics failed to tear down.", e);
+          }
+        }
       } else if (schedulerEvent.getType() ==
           SchedulerEventType.APP_ATTEMPT_ADDED
           && schedulerEvent instanceof AppAttemptAddedSchedulerEvent) {
@@ -380,6 +393,6 @@ public class SLSCapacityScheduler extends CapacityScheduler implements
       throw new YarnException("Can't find the queue by the given name: " + queue
           + "! Please check if queue " + queue + " is in the allocation file.");
     }
-    return getQueue(queue).getQueueName();
+    return getQueue(queue).getQueuePath();
   }
 }

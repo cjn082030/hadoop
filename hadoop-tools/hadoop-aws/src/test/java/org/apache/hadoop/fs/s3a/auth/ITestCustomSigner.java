@@ -47,6 +47,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 
 import static org.apache.hadoop.fs.s3a.Constants.CUSTOM_SIGNERS;
 import static org.apache.hadoop.fs.s3a.Constants.SIGNING_ALGORITHM_S3;
+import static org.apache.hadoop.fs.s3a.impl.NetworkBinding.fixBucketRegion;
 
 /**
  * Tests for custom Signers and SignerInitializers.
@@ -132,16 +133,8 @@ public class ITestCustomSigner extends AbstractS3ATestBase {
   }
 
   private String determineRegion(String bucketName) throws IOException {
-    AmazonS3 s3 = AmazonS3ClientBuilder.standard().withCredentials(
-        new SimpleAWSCredentialsProvider(null, createConfiguration()))
-        .withForceGlobalBucketAccessEnabled(true).withRegion("us-east-1")
-        .build();
-    String region = s3.getBucketLocation(bucketName);
-    //  See: https://forums.aws.amazon.com/thread.jspa?messageID=796829&tstart=0
-    if (region.equals("US")) {
-      region = "us-east-1";
-    }
-    return region;
+    String region = getFileSystem().getBucketLocation(bucketName);
+    return fixBucketRegion(region);
   }
 
   @Private

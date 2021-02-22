@@ -21,8 +21,10 @@ package org.apache.hadoop.fs.s3a.impl;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 
-import com.google.common.util.concurrent.ListeningExecutorService;
+import org.apache.hadoop.thirdparty.com.google.common.util.concurrent.ListeningExecutorService;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -31,12 +33,13 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.Invoker;
 import org.apache.hadoop.fs.s3a.S3AFileStatus;
 import org.apache.hadoop.fs.s3a.S3AInputPolicy;
-import org.apache.hadoop.fs.s3a.S3AInstrumentation;
 import org.apache.hadoop.fs.s3a.S3AStorageStatistics;
 import org.apache.hadoop.fs.s3a.Statistic;
+import org.apache.hadoop.fs.s3a.statistics.S3AStatisticsContext;
 import org.apache.hadoop.fs.s3a.s3guard.ITtlTimeProvider;
 import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.LambdaUtils;
 import org.apache.hadoop.util.SemaphoredDelegatingExecutor;
 
 /**
@@ -49,9 +52,10 @@ import org.apache.hadoop.util.SemaphoredDelegatingExecutor;
  * their own.
  *
  * <i>Warning:</i> this really is private and unstable. Do not use
- * outside the org.apache.hadoop.fs.s3a package.
+ * outside the org.apache.hadoop.fs.s3a package, or in extension points
+ * such as DelegationTokens.
  */
-@InterfaceAudience.Private
+@InterfaceAudience.LimitedPrivate("S3A Filesystem and extensions")
 @InterfaceStability.Unstable
 public class StoreContext {
 
@@ -84,7 +88,8 @@ public class StoreContext {
   private final Invoker invoker;
 
   /** Instrumentation and statistics. */
-  private final S3AInstrumentation instrumentation;
+  private final S3AStatisticsContext instrumentation;
+
   private final S3AStorageStatistics storageStatistics;
 
   /** Seek policy. */
@@ -114,8 +119,7 @@ public class StoreContext {
 
   /**
    * Instantiate.
-   * No attempt to use a builder here as outside tests
-   * this should only be created in the S3AFileSystem.
+   * @deprecated as public method: use {@link StoreContextBuilder}.
    */
   public StoreContext(
       final URI fsURI,
@@ -126,7 +130,7 @@ public class StoreContext {
       final ListeningExecutorService executor,
       final int executorCapacity,
       final Invoker invoker,
-      final S3AInstrumentation instrumentation,
+      final S3AStatisticsContext instrumentation,
       final S3AStorageStatistics storageStatistics,
       final S3AInputPolicy inputPolicy,
       final ChangeDetectionPolicy changeDetectionPolicy,
@@ -183,7 +187,12 @@ public class StoreContext {
     return invoker;
   }
 
-  public S3AInstrumentation getInstrumentation() {
+  /**
+   * Get the statistics context for this StoreContext.
+   * @return the statistics context this store context was created
+   * with.
+   */
+  public S3AStatisticsContext getInstrumentation() {
     return instrumentation;
   }
 
@@ -207,6 +216,10 @@ public class StoreContext {
     return useListV1;
   }
 
+  public ContextAccessors getContextAccessors() {
+    return contextAccessors;
+  }
+
   /**
    * Convert a key to a fully qualified path.
    * @param key input key
@@ -224,6 +237,16 @@ public class StoreContext {
    */
   public String pathToKey(Path path) {
     return contextAccessors.pathToKey(path);
+  }
+
+  /**
+   * Qualify a path.
+   *
+   * @param path path to qualify/normalize
+   * @return possibly new path.
+   */
+  public Path makeQualified(Path path) {
+    return contextAccessors.makeQualified(path);
   }
 
   /**
@@ -251,7 +274,6 @@ public class StoreContext {
    */
   public void incrementStatistic(Statistic statistic, long count) {
     instrumentation.incrementCounter(statistic, count);
-    storageStatistics.incrementCounter(statistic, count);
   }
 
   /**
@@ -350,5 +372,21 @@ public class StoreContext {
     return (stat.isDirectory() && !k.endsWith("/"))
         ? k + "/"
         : k;
+  }
+
+  /**
+   * Submit a closure for execution in the executor
+   * returned by {@link #getExecutor()}.
+   * @param <T> type of future
+   * @param future future for the result.
+   * @param call callable to invoke.
+   * @return the future passed in
+   */
+  public <T> CompletableFuture<T> submit(
+      final CompletableFuture<T> future,
+      final Callable<T> call) {
+    getExecutor().submit(() ->
+        LambdaUtils.eval(future, call));
+    return future;
   }
 }

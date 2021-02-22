@@ -17,11 +17,11 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Sets;
 
 import java.util.Set;
 import org.apache.commons.logging.Log;
@@ -41,6 +41,7 @@ import org.apache.hadoop.ha.ServiceFailedException;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.DFSUtilClient;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HAUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
@@ -87,16 +88,16 @@ import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.RefreshAuthorizationPolicyProtocol;
 import org.apache.hadoop.tools.GetUserMappingsProtocol;
-import org.apache.hadoop.tracing.TraceAdminProtocol;
 import org.apache.hadoop.tracing.TraceUtils;
-import org.apache.hadoop.tracing.TracerConfigurationManager;
 import org.apache.hadoop.util.ExitUtil.ExitException;
 import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.util.JvmPauseMonitor;
 import org.apache.hadoop.util.ServicePlugin;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
-import org.apache.htrace.core.Tracer;
+import org.apache.hadoop.util.GcTimeMonitor;
+import org.apache.hadoop.util.GcTimeMonitor.Builder;
+import org.apache.hadoop.tracing.Tracer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -122,6 +123,8 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERV
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.FS_TRASH_INTERVAL_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_KEY;
 import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_DEFAULT;
@@ -176,6 +179,14 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_STRE
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_ENABLE;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_REPLICATOR_CLASSNAME_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY;
 
 import static org.apache.hadoop.util.ExitUtil.terminate;
 import static org.apache.hadoop.util.ToolRunner.confirmPrompt;
@@ -290,7 +301,7 @@ public class NameNode extends ReconfigurableBase implements
     DFS_NAMENODE_KERBEROS_PRINCIPAL_KEY,
     DFS_NAMENODE_KERBEROS_INTERNAL_SPNEGO_PRINCIPAL_KEY,
     DFS_HA_FENCE_METHODS_KEY,
-    DFS_HA_ZKFC_PORT_KEY,
+    DFS_HA_ZKFC_PORT_KEY
   };
   
   /**
@@ -314,7 +325,10 @@ public class NameNode extends ReconfigurableBase implements
           DFS_STORAGE_POLICY_SATISFIER_MODE_KEY,
           DFS_NAMENODE_REPLICATION_MAX_STREAMS_KEY,
           DFS_NAMENODE_REPLICATION_STREAMS_HARD_LIMIT_KEY,
-          DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION));
+          DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION,
+          DFS_BLOCK_REPLICATOR_CLASSNAME_KEY,
+          DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY,
+          DFS_IMAGE_PARALLEL_LOAD_KEY));
 
   private static final String USAGE = "Usage: hdfs namenode ["
       + StartupOption.BACKUP.getName() + "] | \n\t["
@@ -359,8 +373,6 @@ public class NameNode extends ReconfigurableBase implements
       return RefreshCallQueueProtocol.versionID;
     } else if (protocol.equals(GetUserMappingsProtocol.class.getName())){
       return GetUserMappingsProtocol.versionID;
-    } else if (protocol.equals(TraceAdminProtocol.class.getName())){
-      return TraceAdminProtocol.versionID;
     } else {
       throw new IOException("Unknown protocol to name node: " + protocol);
     }
@@ -372,6 +384,7 @@ public class NameNode extends ReconfigurableBase implements
    */
   @Deprecated
   public static final int DEFAULT_PORT = DFS_NAMENODE_RPC_PORT_DEFAULT;
+  public static final String FS_HDFS_IMPL_KEY = "fs.hdfs.impl";
   public static final Logger LOG =
       LoggerFactory.getLogger(NameNode.class.getName());
   public static final Logger stateChangeLog =
@@ -411,9 +424,9 @@ public class NameNode extends ReconfigurableBase implements
   private NameNodeRpcServer rpcServer;
 
   private JvmPauseMonitor pauseMonitor;
+  private GcTimeMonitor gcTimeMonitor;
   private ObjectName nameNodeStatusBeanName;
   protected final Tracer tracer;
-  protected final TracerConfigurationManager tracerConfigurationManager;
   ScheduledThreadPoolExecutor metricsLoggerTimer;
 
   /**
@@ -724,6 +737,22 @@ public class NameNode extends ReconfigurableBase implements
     pauseMonitor.start();
     metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
 
+    if (conf.getBoolean(DFS_NAMENODE_GC_TIME_MONITOR_ENABLE,
+        DFS_NAMENODE_GC_TIME_MONITOR_ENABLE_DEFAULT)) {
+      long observationWindow = conf.getTimeDuration(
+          DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS,
+          DFS_NAMENODE_GC_TIME_MONITOR_OBSERVATION_WINDOW_MS_DEFAULT,
+          TimeUnit.MILLISECONDS);
+      long sleepInterval = conf.getTimeDuration(
+          DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS,
+          DFS_NAMENODE_GC_TIME_MONITOR_SLEEP_INTERVAL_MS_DEFAULT,
+          TimeUnit.MILLISECONDS);
+      gcTimeMonitor = new Builder().observationWindowMs(observationWindow)
+          .sleepIntervalMs(sleepInterval).build();
+      gcTimeMonitor.start();
+      metrics.getJvmMetrics().setGcTimeMonitor(gcTimeMonitor);
+    }
+
     if (NamenodeRole.NAMENODE == role) {
       startHttpServer(conf);
     }
@@ -897,7 +926,9 @@ public class NameNode extends ReconfigurableBase implements
         new PrivilegedExceptionAction<FileSystem>() {
           @Override
           public FileSystem run() throws IOException {
-            return FileSystem.get(conf);
+            FileSystem dfs = new DistributedFileSystem();
+            dfs.initialize(FileSystem.getDefaultUri(conf), conf);
+            return dfs;
           }
         });
     this.emptier = new Thread(new Trash(fs, conf).getEmptier(), "Trash Emptier");
@@ -964,8 +995,6 @@ public class NameNode extends ReconfigurableBase implements
     this.tracer = new Tracer.Builder("NameNode").
         conf(TraceUtils.wrapHadoopConf(NAMENODE_HTRACE_PREFIX, conf)).
         build();
-    this.tracerConfigurationManager =
-        new TracerConfigurationManager(NAMENODE_HTRACE_PREFIX, conf);
     this.role = role;
     String nsId = getNameServiceId(conf);
     String namenodeId = HAUtil.getNameNodeId(conf, nsId);
@@ -2154,6 +2183,12 @@ public class NameNode extends ReconfigurableBase implements
         || property.equals(
             DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION)) {
       return reconfReplicationParameters(newVal, property);
+    } else if (property.equals(DFS_BLOCK_REPLICATOR_CLASSNAME_KEY) || property
+        .equals(DFS_BLOCK_PLACEMENT_EC_CLASSNAME_KEY)) {
+      reconfBlockPlacementPolicy();
+      return newVal;
+    } else if (property.equals(DFS_IMAGE_PARALLEL_LOAD_KEY)) {
+      return reconfigureParallelLoad(newVal);
     } else {
       throw new ReconfigurationException(property, newVal, getConf().get(
           property));
@@ -2196,6 +2231,11 @@ public class NameNode extends ReconfigurableBase implements
     } finally {
       namesystem.writeUnlock();
     }
+  }
+
+  private void reconfBlockPlacementPolicy() {
+    getNamesystem().getBlockManager()
+        .refreshBlockPlacementPolicy(getNewConf());
   }
 
   private int adjustNewVal(int defaultVal, String newVal) {
@@ -2322,6 +2362,17 @@ public class NameNode extends ReconfigurableBase implements
       }
     }
     return newVal;
+  }
+
+  String reconfigureParallelLoad(String newVal) {
+    boolean enableParallelLoad;
+    if (newVal == null) {
+      enableParallelLoad = DFS_IMAGE_PARALLEL_LOAD_DEFAULT;
+    } else {
+      enableParallelLoad = Boolean.parseBoolean(newVal);
+    }
+    FSImageFormatProtobuf.refreshParallelSaveAndLoad(enableParallelLoad);
+    return Boolean.toString(enableParallelLoad);
   }
 
   @Override  // ReconfigurableBase

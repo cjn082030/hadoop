@@ -45,7 +45,6 @@ import org.apache.hadoop.fs.contract.ContractTestUtils;
 import org.apache.hadoop.fs.s3a.AbstractS3ATestBase;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.s3a.S3ATestUtils;
-import org.apache.hadoop.fs.s3a.S3AUtils;
 import org.apache.hadoop.fs.s3a.Statistic;
 import org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore;
 import org.apache.hadoop.mapred.LocatedFileStatusFetcher;
@@ -54,13 +53,13 @@ import org.apache.hadoop.mapreduce.lib.input.InvalidInputException;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.createFile;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.touch;
 import static org.apache.hadoop.fs.s3a.Constants.ASSUMED_ROLE_ARN;
+import static org.apache.hadoop.fs.s3a.Constants.AUTHORITATIVE_PATH;
 import static org.apache.hadoop.fs.s3a.Constants.METADATASTORE_AUTHORITATIVE;
 import static org.apache.hadoop.fs.s3a.Constants.S3_METADATA_STORE_IMPL;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.assume;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.assumeS3GuardState;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.disableFilesystemCaching;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.getTestBucketName;
-import static org.apache.hadoop.fs.s3a.S3ATestUtils.isS3GuardTestPropertySet;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.lsR;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.removeBaseAndBucketOverrides;
 import static org.apache.hadoop.fs.s3a.S3ATestUtils.removeBucketOverrides;
@@ -71,6 +70,7 @@ import static org.apache.hadoop.fs.s3a.auth.RoleModel.statement;
 import static org.apache.hadoop.fs.s3a.auth.RolePolicies.*;
 import static org.apache.hadoop.fs.s3a.auth.RoleTestUtils.bindRolePolicyStatements;
 import static org.apache.hadoop.fs.s3a.auth.RoleTestUtils.newAssumedRoleConfig;
+import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
 import static org.apache.hadoop.mapreduce.lib.input.FileInputFormat.LIST_STATUS_NUM_THREADS;
 import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
 import static org.apache.hadoop.test.GenericTestUtils.failif;
@@ -221,13 +221,10 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
   public Configuration createConfiguration() {
     Configuration conf = super.createConfiguration();
     String bucketName = getTestBucketName(conf);
-    // is s3guard enabled?
-    boolean guardedTestRun = isS3GuardTestPropertySet(conf);
 
-    // in a guarded test run, except for the special case of raw,
-    // all DDB settings are left alone.
     removeBaseAndBucketOverrides(bucketName, conf,
-        METADATASTORE_AUTHORITATIVE);
+        METADATASTORE_AUTHORITATIVE,
+        AUTHORITATIVE_PATH);
     removeBucketOverrides(bucketName, conf,
         S3_METADATA_STORE_IMPL);
     if (!s3guard) {
@@ -255,7 +252,7 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     try {
       super.teardown();
     } finally {
-      S3AUtils.closeAll(LOG, readonlyFS);
+      cleanupWithLogger(LOG, readonlyFS);
     }
   }
 
@@ -317,8 +314,10 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     verifyS3GuardSettings(realFS, "real filesystem");
 
     // avoiding the parameterization to steer clear of accidentally creating
-    // patterns
-    basePath = path("testNoReadAccess-" + name);
+    // patterns; a timestamp is used to ensure tombstones from previous runs
+    // do not interfere
+    basePath = path("testNoReadAccess-" + name
+        + "-" + System.currentTimeMillis() / 1000);
 
     // define the paths and create them.
     describe("Creating test directories and files");
@@ -411,8 +410,7 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
 
 
     // this is HEAD + "/" on S3; get on S3Guard auth when the path exists,
-    accessDeniedIf(!s3guard, () ->
-        readonlyFS.listStatus(emptyDir));
+    readonlyFS.listStatus(emptyDir);
 
     // a recursive list of the no-read-directory works because
     // there is no directory marker, it becomes a LIST call.
@@ -422,12 +420,7 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     // and so working.
     readonlyFS.getFileStatus(noReadDir);
 
-    // empty dir checks work when guarded because even in non-auth mode
-    // there are no checks for directories being out of date
-    // without S3, the HEAD path + "/" is blocked
-    accessDeniedIf(!s3guard, () ->
-        readonlyFS.getFileStatus(emptyDir));
-
+    readonlyFS.getFileStatus(emptyDir);
     // now look at a file; the outcome depends on the mode.
     accessDeniedIf(!guardedInAuthMode, () ->
         readonlyFS.getFileStatus(subdirFile));
@@ -465,14 +458,14 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     // a file fails if not in auth mode
     globFS(readonlyFS, subdirFile, null, !guardedInAuthMode, 1);
     // empty directories don't fail.
-    FileStatus[] st = globFS(readonlyFS, emptyDir, null, !s3guard, 1);
+    FileStatus[] st = globFS(readonlyFS, emptyDir, null, false, 1);
     if (s3guard) {
       assertStatusPathEquals(emptyDir, st);
     }
 
     st = globFS(readonlyFS,
         noReadWildcard,
-        null, !s3guard, 2);
+        null, false, 2);
     if (s3guard) {
       Assertions.assertThat(st)
           .extracting(FileStatus::getPath)
@@ -482,12 +475,12 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     // there is precisely one .docx file (subdir2File2.docx)
     globFS(readonlyFS,
         new Path(noReadDir, "*/*.docx"),
-        null, !s3guard, 1);
+        null, false, 1);
 
     // there are no .doc files.
     globFS(readonlyFS,
         new Path(noReadDir, "*/*.doc"),
-        null, !s3guard, 0);
+        null, false, 0);
     globFS(readonlyFS, noReadDir,
         EVERYTHING, false, 1);
     // and a filter without any wildcarded pattern only finds
@@ -514,17 +507,14 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
             true,
             HIDDEN_FILE_FILTER,
             true);
-    accessDeniedIf(!s3guard,
-        () -> fetcher.getFileStatuses())
-        .ifPresent(stats -> {
-          Assertions.assertThat(stats)
-              .describedAs("result of located scan").flatExtracting(FileStatus::getPath)
-              .containsExactlyInAnyOrder(
-                  emptyFile,
-                  subdirFile,
-                  subdir2File1,
-                  subdir2File2);
-        });
+    Assertions.assertThat(fetcher.getFileStatuses())
+        .describedAs("result of located scan")
+        .flatExtracting(FileStatus::getPath)
+        .containsExactlyInAnyOrder(
+            emptyFile,
+            subdirFile,
+            subdir2File1,
+            subdir2File2);
   }
 
   /**
@@ -543,15 +533,11 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
             true,
             EVERYTHING,
             true);
-    accessDeniedIf(!s3guard,
-        () -> fetcher.getFileStatuses())
-        .ifPresent(stats -> {
-          Assertions.assertThat(stats)
-              .describedAs("result of located scan")
-              .isNotNull()
-              .flatExtracting(FileStatus::getPath)
-              .containsExactlyInAnyOrder(subdirFile, subdir2File1);
-        });
+    Assertions.assertThat(fetcher.getFileStatuses())
+        .describedAs("result of located scan")
+        .isNotNull()
+        .flatExtracting(FileStatus::getPath)
+        .containsExactlyInAnyOrder(subdirFile, subdir2File1);
   }
 
   /**
@@ -628,23 +614,20 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
    * Do some cleanup to see what happens with delete calls.
    * Cleanup happens in test teardown anyway; doing it here
    * just makes use of the delete calls to see how delete failures
-   * change with permissions and S3Guard stettings.
+   * change with permissions and S3Guard settings.
    */
   public void checkDeleteOperations() throws Throwable {
     describe("Testing delete operations");
-
+    readonlyFS.delete(emptyDir, true);
     if (!authMode) {
-      // unguarded or non-auth S3Guard to fail on HEAD + /
-      accessDenied(() -> readonlyFS.delete(emptyDir, true));
       // to fail on HEAD
       accessDenied(() -> readonlyFS.delete(emptyFile, true));
     } else {
-      // auth mode checks DDB for status and then issues the DELETE
-      readonlyFS.delete(emptyDir, true);
+      // checks DDB for status and then issues the DELETE
       readonlyFS.delete(emptyFile, true);
     }
 
-    // this will succeed for both as there is no subdir marker.
+    // this will succeed for both
     readonlyFS.delete(subDir, true);
     // after which  it is not there
     fileNotFound(() -> readonlyFS.getFileStatus(subDir));
@@ -741,7 +724,7 @@ public class ITestRestrictedReadAccess extends AbstractS3ATestBase {
     S3ATestUtils.MetricDiff getMetric = new S3ATestUtils.MetricDiff(fs,
         Statistic.OBJECT_METADATA_REQUESTS);
     S3ATestUtils.MetricDiff listMetric = new S3ATestUtils.MetricDiff(fs,
-        Statistic.OBJECT_LIST_REQUESTS);
+        Statistic.OBJECT_LIST_REQUEST);
     FileStatus[] st;
     try {
       st = filter == null

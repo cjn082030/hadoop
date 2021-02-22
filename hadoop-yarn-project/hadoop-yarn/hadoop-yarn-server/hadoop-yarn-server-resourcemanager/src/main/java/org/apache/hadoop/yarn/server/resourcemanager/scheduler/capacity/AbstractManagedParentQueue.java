@@ -58,7 +58,7 @@ public abstract class AbstractManagedParentQueue extends ParentQueue {
     writeLock.lock();
     try {
       // Set new configs
-      setupQueueConfigs(clusterResource);
+      setupQueueConfigs(clusterResource, csContext.getConfiguration());
 
     } finally {
       writeLock.unlock();
@@ -106,7 +106,7 @@ public abstract class AbstractManagedParentQueue extends ParentQueue {
         CSQueue cs = qiter.next();
         if (cs.equals(childQueue)) {
           qiter.remove();
-          LOG.debug("Removed child queue: {}", cs.getQueueName());
+          LOG.debug("Removed child queue: {}", cs.getQueuePath());
         }
       }
     } finally {

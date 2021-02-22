@@ -35,18 +35,20 @@ import com.amazonaws.services.s3.model.AmazonS3Exception;
 import com.amazonaws.services.s3.model.MultiObjectDeleteException;
 import com.amazonaws.services.s3.model.S3ObjectSummary;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.fs.RemoteIterator;
+import org.apache.hadoop.util.functional.RemoteIterators;
 import org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider;
 import org.apache.hadoop.fs.s3a.impl.NetworkBinding;
 import org.apache.hadoop.fs.s3native.S3xLoginHelper;
@@ -54,7 +56,7 @@ import org.apache.hadoop.net.ConnectTimeoutException;
 import org.apache.hadoop.security.ProviderUtils;
 import org.apache.hadoop.util.VersionInfo;
 
-import com.google.common.collect.Lists;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,10 +84,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.apache.hadoop.fs.s3a.Constants.*;
+import static org.apache.hadoop.fs.s3a.impl.ErrorTranslation.isUnknownBucket;
 import static org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport.translateDeleteException;
+import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
 
 /**
  * Utility methods for S3A code.
@@ -247,6 +252,18 @@ public final class S3AUtils {
 
       // the object isn't there
       case 404:
+        if (isUnknownBucket(ase)) {
+          // this is a missing bucket
+          ioe = new UnknownStoreException(path, ase);
+        } else {
+          // a normal unknown object
+          ioe = new FileNotFoundException(message);
+          ioe.initCause(ase);
+        }
+        break;
+
+      // this also surfaces sometimes and is considered to
+      // be ~ a not found exception.
       case 410:
         ioe = new FileNotFoundException(message);
         ioe.initCause(ase);
@@ -1283,6 +1300,15 @@ public final class S3AUtils {
         DEFAULT_SOCKET_SEND_BUFFER, 2048);
     int sockRecvBuffer = intOption(conf, SOCKET_RECV_BUFFER,
         DEFAULT_SOCKET_RECV_BUFFER, 2048);
+    long requestTimeoutMillis = conf.getTimeDuration(REQUEST_TIMEOUT,
+        DEFAULT_REQUEST_TIMEOUT, TimeUnit.SECONDS, TimeUnit.MILLISECONDS);
+
+    if (requestTimeoutMillis > Integer.MAX_VALUE) {
+      LOG.debug("Request timeout is too high({} ms). Setting to {} ms instead",
+          requestTimeoutMillis, Integer.MAX_VALUE);
+      requestTimeoutMillis = Integer.MAX_VALUE;
+    }
+    awsConf.setRequestTimeout((int) requestTimeoutMillis);
     awsConf.setSocketBufferSizeHints(sockSendBuffer, sockRecvBuffer);
     String signerOverride = conf.getTrimmed(SIGNING_ALGORITHM, "");
     if (!signerOverride.isEmpty()) {
@@ -1393,6 +1419,30 @@ public final class S3AUtils {
   }
 
   /**
+   * Convert the data of an iterator of {@link S3AFileStatus} to
+   * an array. Given tombstones are filtered out. If the iterator
+   * does return any item, an empty array is returned.
+   * @param iterator a non-null iterator
+   * @param tombstones
+   * @return a possibly-empty array of file status entries
+   * @throws IOException
+   */
+  public static S3AFileStatus[] iteratorToStatuses(
+      RemoteIterator<S3AFileStatus> iterator, Set<Path> tombstones)
+      throws IOException {
+    List<FileStatus> statuses = new ArrayList<>();
+
+    while (iterator.hasNext()) {
+      S3AFileStatus status = iterator.next();
+      if (!tombstones.contains(status.getPath())) {
+        statuses.add(status);
+      }
+    }
+
+    return statuses.toArray(new S3AFileStatus[0]);
+  }
+
+  /**
    * An interface for use in lambda-expressions working with
    * directory tree listings.
    */
@@ -1421,12 +1471,7 @@ public final class S3AUtils {
   public static long applyLocatedFiles(
       RemoteIterator<? extends LocatedFileStatus> iterator,
       CallOnLocatedFileStatus eval) throws IOException {
-    long count = 0;
-    while (iterator.hasNext()) {
-      count++;
-      eval.call(iterator.next());
-    }
-    return count;
+    return RemoteIterators.foreach(iterator, eval::call);
   }
 
   /**
@@ -1613,26 +1658,17 @@ public final class S3AUtils {
   /**
    * Close the Closeable objects and <b>ignore</b> any Exception or
    * null pointers.
-   * (This is the SLF4J equivalent of that in {@code IOUtils}).
+   * This is obsolete: use
+   * {@link org.apache.hadoop.io.IOUtils#cleanupWithLogger(Logger, Closeable...)}
    * @param log the log to log at debug level. Can be null.
    * @param closeables the objects to close
    */
+  @Deprecated
   public static void closeAll(Logger log,
       Closeable... closeables) {
-    if (log == null) {
-      log = LOG;
-    }
-    for (Closeable c : closeables) {
-      if (c != null) {
-        try {
-          log.debug("Closing {}", c);
-          c.close();
-        } catch (Exception e) {
-          log.debug("Exception in closing {}", c, e);
-        }
-      }
-    }
+    cleanupWithLogger(log, closeables);
   }
+
   /**
    * Close the Closeable objects and <b>ignore</b> any Exception or
    * null pointers.
@@ -1711,6 +1747,21 @@ public final class S3AUtils {
     return conf.get(FS_S3A_BUCKET_PREFIX + bucket + '.' + baseKey);
   }
 
+  /**
+   * Turns a path (relative or otherwise) into an S3 key, adding a trailing
+   * "/" if the path is not the root <i>and</i> does not already have a "/"
+   * at the end.
+   *
+   * @param key s3 key or ""
+   * @return the with a trailing "/", or, if it is the root key, "",
+   */
+  public static String maybeAddTrailingSlash(String key) {
+    if (!key.isEmpty() && !key.endsWith("/")) {
+      return key + '/';
+    } else {
+      return key;
+    }
+  }
 
   /**
    * Path filter which ignores any file which starts with . or _.

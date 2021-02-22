@@ -95,8 +95,8 @@ import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Supplier;
-import com.google.common.collect.Maps;
+import java.util.function.Supplier;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
 
 public class TestMover {
   private static final Logger LOG = LoggerFactory.getLogger(TestMover.class);
@@ -446,6 +446,12 @@ public class TestMover {
     final Configuration conf = new HdfsConfiguration();
     initConf(conf);
     testWithinSameNode(conf);
+    // Test movement with hardlink, when same disk tiering is enabled.
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_ALLOW_SAME_DISK_TIERING, true);
+    conf.setDouble(DFSConfigKeys
+        .DFS_DATANODE_RESERVE_FOR_ARCHIVE_DEFAULT_PERCENTAGE, 0.5);
+    testWithinSameNode(conf);
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_ALLOW_SAME_DISK_TIERING, false);
   }
 
   private void checkMovePaths(List<Path> actual, Path... expected) {

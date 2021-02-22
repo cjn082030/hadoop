@@ -58,9 +58,8 @@ import org.apache.hadoop.hdfs.server.namenode.NNStorage;
 import org.apache.hadoop.hdfs.server.namenode.NameNodeLayoutVersion;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.io.IOUtils;
-import org.apache.hadoop.ipc.ProtobufRpcEngine;
+import org.apache.hadoop.ipc.ProtobufRpcEngine2;
 import org.apache.hadoop.test.GenericTestUtils;
-import org.apache.log4j.Level;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -69,7 +68,8 @@ import org.junit.rules.TestName;
 import org.mockito.Mockito;
 import org.mockito.stubbing.Stubber;
 
-import com.google.common.collect.Lists;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
+import org.slf4j.event.Level;
 
 /**
  * Functional tests for QuorumJournalManager.
@@ -87,7 +87,7 @@ public class TestQuorumJournalManager {
   private final List<QuorumJournalManager> toClose = Lists.newLinkedList();
   
   static {
-    GenericTestUtils.setLogLevel(ProtobufRpcEngine.LOG, Level.ALL);
+    GenericTestUtils.setLogLevel(ProtobufRpcEngine2.LOG, Level.TRACE);
   }
 
   @Rule

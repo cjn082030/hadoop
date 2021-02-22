@@ -20,7 +20,7 @@
 
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime;
 
-import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.authorize.AccessControlList;
@@ -209,6 +209,9 @@ public class DockerLinuxContainerRuntime extends OCIContainerRuntime {
   private static final String DEFAULT_PROCFS = "/proc";
 
   @InterfaceAudience.Private
+  private static final String RUNTIME_TYPE = "DOCKER";
+
+  @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_IMAGE =
       "YARN_CONTAINER_RUNTIME_DOCKER_IMAGE";
   @InterfaceAudience.Private
@@ -240,12 +243,10 @@ public class DockerLinuxContainerRuntime extends OCIContainerRuntime {
       "YARN_CONTAINER_RUNTIME_DOCKER_SERVICE_MODE";
 
   @InterfaceAudience.Private
-  private static final String RUNTIME_TYPE = "DOCKER";
-  @InterfaceAudience.Private
-  private final static String ENV_OCI_CONTAINER_PID_NAMESPACE =
+  public final static String ENV_OCI_CONTAINER_PID_NAMESPACE =
       formatOciEnvKey(RUNTIME_TYPE, CONTAINER_PID_NAMESPACE_SUFFIX);
   @InterfaceAudience.Private
-  private final static String ENV_OCI_CONTAINER_RUN_PRIVILEGED_CONTAINER =
+  public final static String ENV_OCI_CONTAINER_RUN_PRIVILEGED_CONTAINER =
       formatOciEnvKey(RUNTIME_TYPE, RUN_PRIVILEGED_CONTAINER_SUFFIX);
 
   private Configuration conf;

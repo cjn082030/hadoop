@@ -38,7 +38,7 @@ import org.apache.hadoop.hdfs.server.namenode.FSDirectory.DirOp;
 import org.apache.hadoop.hdfs.util.EnumCounters;
 import org.apache.hadoop.security.AccessControlException;
 
-import com.google.common.collect.Lists;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -47,7 +47,6 @@ import java.util.EnumSet;
 import java.util.List;
 
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_QUOTA_BY_STORAGETYPE_ENABLED_KEY;
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_STORAGE_POLICY_ENABLED_KEY;
 
 public class FSDirAttrOp {
   static FileStatus setPermission(
@@ -57,15 +56,18 @@ public class FSDirAttrOp {
       throw new InvalidPathException(src);
     }
     INodesInPath iip;
+    boolean changed;
     fsd.writeLock();
     try {
       iip = fsd.resolvePath(pc, src, DirOp.WRITE);
       fsd.checkOwner(pc, iip);
-      unprotectedSetPermission(fsd, iip, permission);
+      changed = unprotectedSetPermission(fsd, iip, permission);
     } finally {
       fsd.writeUnlock();
     }
-    fsd.getEditLog().logSetPermissions(iip.getPath(), permission);
+    if (changed) {
+      fsd.getEditLog().logSetPermissions(iip.getPath(), permission);
+    }
     return fsd.getAuditFileInfo(iip);
   }
 
@@ -76,6 +78,7 @@ public class FSDirAttrOp {
       throw new InvalidPathException(src);
     }
     INodesInPath iip;
+    boolean changed;
     fsd.writeLock();
     try {
       iip = fsd.resolvePath(pc, src, DirOp.WRITE);
@@ -90,11 +93,13 @@ public class FSDirAttrOp {
               "User " + pc.getUser() + " does not belong to " + group);
         }
       }
-      unprotectedSetOwner(fsd, iip, username, group);
+      changed = unprotectedSetOwner(fsd, iip, username, group);
     } finally {
       fsd.writeUnlock();
     }
-    fsd.getEditLog().logSetOwner(iip.getPath(), username, group);
+    if (changed) {
+      fsd.getEditLog().logSetOwner(iip.getPath(), username, group);
+    }
     return fsd.getAuditFileInfo(iip);
   }
 
@@ -151,7 +156,7 @@ public class FSDirAttrOp {
   static FileStatus unsetStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
       BlockManager bm, String src) throws IOException {
     return setStoragePolicy(fsd, pc, bm, src,
-        HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED, "unset");
+        HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED);
   }
 
   static FileStatus setStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
@@ -162,17 +167,12 @@ public class FSDirAttrOp {
       throw new HadoopIllegalArgumentException(
           "Cannot find a block policy with the name " + policyName);
     }
-    return setStoragePolicy(fsd, pc, bm, src, policy.getId(), "set");
+    return setStoragePolicy(fsd, pc, bm, src, policy.getId());
   }
 
   static FileStatus setStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
-      BlockManager bm, String src, final byte policyId, final String operation)
+      BlockManager bm, String src, final byte policyId)
       throws IOException {
-    if (!fsd.isStoragePolicyEnabled()) {
-      throw new IOException(String.format(
-          "Failed to %s storage policy since %s is set to false.", operation,
-          DFS_STORAGE_POLICY_ENABLED_KEY));
-    }
     INodesInPath iip;
     fsd.writeLock();
     try {
@@ -232,14 +232,21 @@ public class FSDirAttrOp {
    * Note: This does not support ".inodes" relative path.
    */
   static void setQuota(FSDirectory fsd, FSPermissionChecker pc, String src,
-      long nsQuota, long ssQuota, StorageType type) throws IOException {
-    if (fsd.isPermissionEnabled()) {
-      pc.checkSuperuserPrivilege();
-    }
+      long nsQuota, long ssQuota, StorageType type, boolean allowOwner)
+      throws IOException {
 
     fsd.writeLock();
     try {
       INodesInPath iip = fsd.resolvePath(pc, src, DirOp.WRITE);
+      if (fsd.isPermissionEnabled() && !pc.isSuperUser() && allowOwner) {
+        INodeDirectory parentDir= iip.getLastINode().getParent();
+        if (parentDir == null ||
+            !parentDir.getUserName().equals(pc.getUser())) {
+          throw new AccessControlException(
+              "Access denied for user " + pc.getUser() +
+              ". Superuser or owner of parent folder privilege is required");
+        }
+      }
       INodeDirectory changed =
           unprotectedSetQuota(fsd, iip, nsQuota, ssQuota, type);
       if (changed != null) {
@@ -256,28 +263,32 @@ public class FSDirAttrOp {
     }
   }
 
-  static void unprotectedSetPermission(
+  static boolean unprotectedSetPermission(
       FSDirectory fsd, INodesInPath iip, FsPermission permissions)
       throws FileNotFoundException, UnresolvedLinkException,
              QuotaExceededException, SnapshotAccessControlException {
     assert fsd.hasWriteLock();
     final INode inode = FSDirectory.resolveLastINode(iip);
     int snapshotId = iip.getLatestSnapshotId();
+    long oldPerm = inode.getPermissionLong();
     inode.setPermission(permissions, snapshotId);
+    return oldPerm != inode.getPermissionLong();
   }
 
-  static void unprotectedSetOwner(
+  static boolean unprotectedSetOwner(
       FSDirectory fsd, INodesInPath iip, String username, String groupname)
       throws FileNotFoundException, UnresolvedLinkException,
       QuotaExceededException, SnapshotAccessControlException {
     assert fsd.hasWriteLock();
     final INode inode = FSDirectory.resolveLastINode(iip);
+    long oldPerm = inode.getPermissionLong();
     if (username != null) {
       inode.setUser(username, iip.getLatestSnapshotId());
     }
     if (groupname != null) {
       inode.setGroup(groupname, iip.getLatestSnapshotId());
     }
+    return oldPerm != inode.getPermissionLong();
   }
 
   static boolean setTimes(

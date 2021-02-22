@@ -18,18 +18,23 @@
 
 package org.apache.hadoop.fs.s3a;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.PathIOException;
 import org.apache.hadoop.fs.s3a.commit.PutTracker;
+import org.apache.hadoop.fs.s3a.statistics.impl.EmptyS3AStatisticsContext;
 import org.apache.hadoop.util.Progressable;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.concurrent.ExecutorService;
 
-import static org.junit.Assert.*;
+import static org.apache.hadoop.test.LambdaTestUtils.intercept;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for {@link S3ABlockOutputStream}.
@@ -45,11 +50,10 @@ public class TestS3ABlockOutputStream extends AbstractS3AMockTest {
     S3ADataBlocks.BlockFactory blockFactory =
         mock(S3ADataBlocks.BlockFactory.class);
     long blockSize = Constants.DEFAULT_MULTIPART_SIZE;
-    S3AInstrumentation.OutputStreamStatistics statistics = null;
     WriteOperationHelper oHelper = mock(WriteOperationHelper.class);
     PutTracker putTracker = mock(PutTracker.class);
     stream = spy(new S3ABlockOutputStream(fs, "", executorService,
-      progressable, blockSize, blockFactory, statistics, oHelper,
+      progressable, blockSize, blockFactory, null, oHelper,
       putTracker));
   }
 
@@ -57,10 +61,51 @@ public class TestS3ABlockOutputStream extends AbstractS3AMockTest {
   public void testFlushNoOpWhenStreamClosed() throws Exception {
     doThrow(new IOException()).when(stream).checkOpen();
 
-    try {
-      stream.flush();
-    } catch (Exception e){
-      fail("Should not have any exception.");
-    }
+    stream.flush();
+  }
+
+  @Test
+  public void testWriteOperationHelperPartLimits() throws Throwable {
+    S3AFileSystem s3a = mock(S3AFileSystem.class);
+    when(s3a.getBucket()).thenReturn("bucket");
+    WriteOperationHelper woh = new WriteOperationHelper(s3a,
+        new Configuration(),
+        new EmptyS3AStatisticsContext());
+    ByteArrayInputStream inputStream = new ByteArrayInputStream(
+        "a".getBytes());
+    // first one works
+    String key = "destKey";
+    woh.newUploadPartRequest(key,
+        "uploadId", 1, 1024, inputStream, null, 0L);
+    // but ask past the limit and a PathIOE is raised
+    intercept(PathIOException.class, key,
+        () -> woh.newUploadPartRequest(key,
+            "uploadId", 50000, 1024, inputStream, null, 0L));
+  }
+
+  static class StreamClosedException extends IOException {}
+
+  @Test
+  public void testStreamClosedAfterAbort() throws Exception {
+    stream.abort();
+
+    // This verification replaces testing various operations after calling
+    // abort: after calling abort, stream is closed like calling close().
+    intercept(IOException.class, () -> stream.checkOpen());
+
+    // check that calling write() will call checkOpen() and throws exception
+    doThrow(new StreamClosedException()).when(stream).checkOpen();
+
+    intercept(StreamClosedException.class,
+        () -> stream.write(new byte[] {'a', 'b', 'c'}));
+  }
+
+  @Test
+  public void testCallingCloseAfterCallingAbort() throws Exception {
+    stream.abort();
+
+    // This shouldn't throw IOException like calling close() multiple times.
+    // This will ensure abort() can be called with try-with-resource.
+    stream.close();
   }
 }
